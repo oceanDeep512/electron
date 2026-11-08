@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>agent runtime fixture</title>
+  </head>
+  <body>
+    <button id="go" type="button">Go</button>
+    <button id="quoted" type="button" data-label="say &quot;hi&quot;">Quoted</button>
+    <button id="hidden" type="button" style="display: none">Hidden</button>
+    <button id="disabled" type="button" disabled>Disabled</button>
+    <input id="field" value="">
+    <div id="static">Static</div>
+    <iframe src="about:blank"></iframe>
+    <script>
+      document.getElementById('go').addEventListener('click', () => {
+        document.getElementById('go').textContent = 'clicked';
+      });
+    </script>
+  </body>
+</html>

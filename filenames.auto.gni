@@ -561,6 +561,8 @@ auto_filenames = {
 
   lib_typecheck_sources = [
     "build/bundle/typecheck.mjs",
+    "lib/browser/api/agent-runtime-logic.ts",
+    "lib/browser/api/agent-runtime.ts",
     "lib/browser/api/app.ts",
     "lib/browser/api/auto-updater.ts",
     "lib/browser/api/auto-updater/auto-updater-msix.ts",
@@ -693,6 +695,8 @@ auto_filenames = {
   ]
 
   browser_bundle_deps = [
+    "lib/browser/api/agent-runtime-logic.ts",
+    "lib/browser/api/agent-runtime.ts",
     "lib/browser/api/app.ts",
     "lib/browser/api/auto-updater.ts",
     "lib/browser/api/auto-updater/auto-updater-msix.ts",
