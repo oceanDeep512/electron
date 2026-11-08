@@ -5,6 +5,8 @@ import {
   AgentRuntimeError,
   CONTENT_SCRIPT,
   ELEMENT_SCRIPT,
+  applyNavigationEvent,
+  assembleAXSnapshot,
   assertClickable,
   assertContentMaxChars,
   assertEditable,
@@ -13,28 +15,33 @@ import {
   assertNavigableUrl,
   assertPageSize,
   assertSelector,
+  assertSnapshotOptions,
   assertTimeoutMs,
   boxCenter,
   buildIsolatedCall,
   checkPartitionReuse,
   checkpoint,
   claimSlot,
+  createEffectGate,
+  createListenerSet,
+  createNavigation,
   cssPointToWidgetDip,
   decidePersona,
-  httpStatusFromNavigateEvent,
-  isForeignFailureUrl,
+  hostEffectAllowed,
   ownedWebPreferences,
-  partitionRecordForReuse,
+  performHostEffect,
   planKey,
   readContentResult,
   readElementResult,
+  readLoadRejection,
   readNavigationStart,
   releaseSlot,
   resolvePartition,
-  safeUrlForError,
-  shouldArmNavigation,
+  settleEffectGate,
   validatePersona,
   type AgentErrorCode,
+  type AXSnapshot,
+  type EffectGate,
   type ElementBox,
   type NavigationStatus,
   type ResolvedPartition,
@@ -69,6 +76,12 @@ interface PageApi {
     httpStatusSource: NavigationStatus['httpStatusSource'];
   }>;
   content(options?: { maxChars?: number; timeoutMs?: number; signal?: AbortSignal }): Promise<{ html: string; truncated: boolean; length: number }>;
+  snapshot(options?: {
+    maxNodes?: number;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    framePolicy?: 'all' | 'same-origin';
+  }): Promise<AXSnapshot>;
   close(): void;
 }
 
@@ -123,10 +136,11 @@ class AgentPage {
       throw failure('navigation-in-progress', 'This page already has a navigation in progress');
     }
     // Navigation arms its own timer so a timeout can stop the load.
-    return this.operate(options.signal, undefined, async (signal) => {
+    // The outer operation timeout is omitted so it does not stop the load twice.
+    return this.operate(options.signal, undefined, async () => {
       this.navigating = true;
       try {
-        return await this.navigate(target, timeoutMs, signal);
+        return await this.navigate(target, timeoutMs, options.signal);
       } finally {
         this.navigating = false;
       }
@@ -140,6 +154,28 @@ class AgentPage {
       this.assertIdle();
       const raw = await this.eval(buildIsolatedCall(CONTENT_SCRIPT, { maxChars }));
       return readContentResult(raw, maxChars);
+    });
+  }
+
+  async snapshot(options: {
+    maxNodes?: number;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    framePolicy?: 'all' | 'same-origin';
+  } = {}): Promise<AXSnapshot> {
+    const request = assertSnapshotOptions(options);
+    return this.operate(options.signal, request.timeoutMs, async (gate) => {
+      const raw: unknown = await this.webContents.captureAccessibilitySnapshot({
+        maxNodes: request.maxNodes,
+        timeoutMs: request.timeoutMs,
+        framePolicy: request.framePolicy
+      });
+      // A timeout or abort settles the gate before this continuation. Do not
+      // hand the caller a tree after that rejection.
+      if (!hostEffectAllowed(gate)) {
+        throw failure('aborted', 'The accessibility snapshot was discarded after the operation settled');
+      }
+      return assembleAXSnapshot(raw);
     });
   }
 
@@ -161,12 +197,13 @@ class AgentPage {
     }
   }
 
-  async operate<T>(signal: AbortSignal | undefined, timeoutMs: number | undefined, op: (signal: AbortSignal | undefined) => Promise<T>): Promise<T> {
+  async operate<T>(signal: AbortSignal | undefined, timeoutMs: number | undefined, op: (gate: EffectGate) => Promise<T>): Promise<T> {
     this.assertUsable();
     if (signal?.aborted) throw failure('aborted', 'The operation was aborted');
     claimSlot(this.slots, checkpoint.maxInFlight);
+    const gate = createEffectGate();
+    const listeners = createListenerSet();
     let timer: ReturnType<typeof setTimeout> | undefined;
-    let onAbort: (() => void) | undefined;
     let rejectPending: ((code: AgentErrorCode) => void) | undefined;
     try {
       return await new Promise<T>((resolve, reject) => {
@@ -174,6 +211,10 @@ class AgentPage {
         const finish = (callback: () => void) => {
           if (settled) return;
           settled = true;
+          // Settle before the page script's continuation can send input.
+          settleEffectGate(gate);
+          if (timer) clearTimeout(timer);
+          listeners.close();
           callback();
         };
         rejectPending = (code) => {
@@ -186,17 +227,21 @@ class AgentPage {
           }, timeoutMs);
         }
         if (signal) {
-          onAbort = () => finish(() => reject(failure('aborted', 'The operation was aborted')));
+          const onAbort = () => finish(() => reject(failure('aborted', 'The operation was aborted')));
           signal.addEventListener('abort', onAbort, { once: true });
+          listeners.add(() => signal.removeEventListener('abort', onAbort));
         }
-        op(signal).then(
+        op(gate).then(
           (value) => finish(() => resolve(value)),
           (error: unknown) => finish(() => reject(error))
         );
       });
     } finally {
+      // The script cannot be cancelled. Releasing the slot here lets the next
+      // operation run. Host effects stay closed because the gate is settled.
+      settleEffectGate(gate);
       if (timer) clearTimeout(timer);
-      if (signal && onAbort) signal.removeEventListener('abort', onAbort);
+      listeners.close();
       if (rejectPending) this.pending.delete(rejectPending);
       releaseSlot(this.slots);
     }
@@ -208,87 +253,84 @@ class AgentPage {
     signal: AbortSignal | undefined
   ): Promise<{ url: string; httpStatus: number | null; httpStatusText: string; httpStatusSource: NavigationStatus['httpStatusSource'] }> {
     const contents = this.webContents;
-    let status = httpStatusFromNavigateEvent(undefined, undefined);
-    let armed = false;
-    let committed = false;
     return new Promise((resolve, reject) => {
-      let settled = false;
-      const subscriptions: Unsubscribe[] = [];
-      const finish = (callback: () => void) => {
-        if (settled) return;
-        settled = true;
-        for (const unsubscribe of subscriptions) unsubscribe();
-        callback();
+      let state = createNavigation(url);
+      const listeners = createListenerSet();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let published = false;
+      const emit = (event: Parameters<typeof applyNavigationEvent>[1]) => {
+        if (published) return;
+        state = applyNavigationEvent(state, event);
+        if (!state.outcome) return;
+        published = true;
+        if (timer) clearTimeout(timer);
+        listeners.close();
+        const outcome = state.outcome;
+        if (outcome.type === 'success') {
+          resolve({
+            url: outcome.url,
+            httpStatus: outcome.status.httpStatus,
+            httpStatusText: outcome.status.httpStatusText,
+            httpStatusSource: outcome.status.httpStatusSource
+          });
+          return;
+        }
+        reject(failure(outcome.code, outcome.message));
       };
-      const fail = (code: AgentErrorCode, message: string) => finish(() => reject(failure(code, message)));
-      let timedOut = false;
-      subscriptions.push(listen(contents, 'did-start-navigation', (...args) => {
+      listeners.add(listen(contents, 'did-start-navigation', (...args) => {
         const start = readNavigationStart(args);
-        if (!start || !shouldArmNavigation(start)) return;
-        armed = true;
-        status = httpStatusFromNavigateEvent(undefined, undefined);
-        committed = false;
+        if (!start) return;
+        emit({ type: 'start', ...start });
       }));
-      const rememberStatus = (code: unknown, text: unknown) => {
-        if (!armed) return;
-        status = httpStatusFromNavigateEvent(code, text);
-        committed = true;
-      };
-      subscriptions.push(listen(contents, 'did-navigate', (_event, _navigated, code, text) => {
-        rememberStatus(code, text);
+      listeners.add(listen(contents, 'did-navigate', (_event, navigated, code, text) => {
+        emit({
+          type: 'commit',
+          url: typeof navigated === 'string' ? navigated : '',
+          httpResponseCode: code,
+          httpStatusText: text
+        });
       }));
-      subscriptions.push(listen(contents, 'did-frame-navigate', (_event, _navigated, code, text, isMainFrame) => {
-        if (isMainFrame === true) rememberStatus(code, text);
+      listeners.add(listen(contents, 'did-frame-navigate', (_event, navigated, code, text, isMainFrame) => {
+        if (isMainFrame !== true) return;
+        emit({
+          type: 'commit',
+          url: typeof navigated === 'string' ? navigated : '',
+          httpResponseCode: code,
+          httpStatusText: text
+        });
       }));
-      subscriptions.push(listen(contents, 'did-finish-load', () => {
-        if (!armed || !committed) return;
-        finish(() => resolve({
-          url: contents.isDestroyed() ? url : contents.getURL(),
-          httpStatus: status.httpStatus,
-          httpStatusText: status.httpStatusText,
-          httpStatusSource: status.httpStatusSource
-        }));
+      listeners.add(listen(contents, 'did-finish-load', () => {
+        emit({ type: 'finish-load', url: contents.isDestroyed() ? url : contents.getURL() });
       }));
       const onFail = (_event: unknown, errorCode: unknown, errorDescription: unknown, validatedURL: unknown, isMainFrame: unknown) => {
-        if (isMainFrame === false || !armed || isForeignFailureUrl(validatedURL, url)) return;
-        if (timedOut) {
-          fail('timeout', `Navigation timed out after ${timeoutMs}ms for ${safeUrlForError(url)}`);
-          return;
-        }
-        if (signal?.aborted) {
-          fail('aborted', 'The navigation was aborted');
-          return;
-        }
-        const code = typeof errorCode === 'number' ? errorCode : 0;
-        const description = typeof errorDescription === 'string' ? errorDescription : 'navigation failed';
-        fail('navigation-failed', `${description} (${code}) for ${safeUrlForError(url)}`);
+        emit({ type: 'fail', errorCode, errorDescription, validatedURL, isMainFrame });
       };
-      subscriptions.push(listen(contents, 'did-fail-load', onFail));
-      subscriptions.push(listen(contents, 'did-fail-provisional-load', onFail));
-      subscriptions.push(listen(contents, 'destroyed', () => fail('destroyed', 'The page was destroyed during navigation')));
-      subscriptions.push(listen(contents, 'render-process-gone', () => fail('crashed', 'The renderer crashed during navigation')));
+      listeners.add(listen(contents, 'did-fail-load', onFail));
+      listeners.add(listen(contents, 'did-fail-provisional-load', onFail));
+      listeners.add(listen(contents, 'destroyed', () => emit({ type: 'destroyed' })));
+      listeners.add(listen(contents, 'render-process-gone', () => emit({ type: 'crashed' })));
       if (signal) {
         const onAbort = () => {
+          emit({ type: 'abort' });
           if (!contents.isDestroyed()) contents.stop();
-          fail('aborted', 'The navigation was aborted');
         };
         signal.addEventListener('abort', onAbort, { once: true });
-        subscriptions.push(() => signal.removeEventListener('abort', onAbort));
+        listeners.add(() => signal.removeEventListener('abort', onAbort));
       }
-      const timer = setTimeout(() => {
-        timedOut = true;
+      timer = setTimeout(() => {
+        emit({ type: 'timeout', timeoutMs });
         if (!contents.isDestroyed()) contents.stop();
-        fail('timeout', `Navigation timed out after ${timeoutMs}ms for ${safeUrlForError(url)}`);
       }, timeoutMs);
-      subscriptions.push(() => clearTimeout(timer));
-      try {
-        // The returned promise is not an HTTP status. Status comes only from
-        // did-navigate after this call's main-frame navigation has started.
-        contents.loadURL(url).catch(() => undefined);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        fail('navigation-failed', message);
-      }
+      // Resolving this promise is not success and is not an HTTP status.
+      // A rejection other than ERR_ABORTED is a known failure. ERR_ABORTED
+      // can be the about:blank race and is ignored by the reducer.
+      contents.loadURL(url).then(
+        () => undefined,
+        (error: unknown) => {
+          const rejected = readLoadRejection(error);
+          emit({ type: 'load-rejected', errno: rejected.errno, message: rejected.message });
+        }
+      );
     });
   }
 
@@ -376,33 +418,39 @@ class AgentLocator {
 
   click(options: { timeoutMs?: number; signal?: AbortSignal; button?: 'left' | 'middle' | 'right'; scroll?: boolean } = {}): Promise<void> {
     const button = assertMouseButton(options.button);
-    return this.pageAction(options, async () => {
+    return this.pageAction(options, async (gate) => {
       const result = readElementResult(await this.page.probe(this.selector, 'probe', options.scroll !== false));
       if (!result.ok) throw failure(result.reason, result.message);
       if (!('box' in result)) throw failure('page-script-failed', 'Expected an element box');
-      this.page.clickAt(result.box, button);
+      performHostEffect(gate, () => {
+        this.page.clickAt(result.box, button);
+      });
     });
   }
 
   fill(text: string, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<void> {
     const value = assertFillText(text);
-    return this.pageAction(options, async () => {
+    return this.pageAction(options, async (gate) => {
       const result = readElementResult(await this.page.probe(this.selector, 'focus-editable', true));
       if (!result.ok) throw failure(result.reason, result.message);
       if (!('box' in result)) throw failure('page-script-failed', 'Expected an element box');
-      assertEditable(result.box);
-      this.page.insert(value);
+      performHostEffect(gate, () => {
+        assertEditable(result.box);
+        this.page.insert(value);
+      });
     });
   }
 
   press(key: string, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<void> {
     planKey(key);
-    return this.pageAction(options, async () => {
+    return this.pageAction(options, async (gate) => {
       const result = readElementResult(await this.page.probe(this.selector, 'focus-editable', true));
       if (!result.ok) throw failure(result.reason, result.message);
       if (!('box' in result)) throw failure('page-script-failed', 'Expected an element box');
-      assertEditable(result.box);
-      this.page.pressKey(key);
+      performHostEffect(gate, () => {
+        assertEditable(result.box);
+        this.page.pressKey(key);
+      });
     });
   }
 
@@ -417,12 +465,12 @@ class AgentLocator {
 
   private pageAction<T>(
     options: { timeoutMs?: number; signal?: AbortSignal },
-    op: () => Promise<T>
+    op: (gate: EffectGate) => Promise<T>
   ): Promise<T> {
     const timeoutMs = assertTimeoutMs(options.timeoutMs, checkpoint.defaultActionTimeoutMs);
-    return this.page.operate(options.signal, timeoutMs, async () => {
+    return this.page.operate(options.signal, timeoutMs, async (gate) => {
       this.page.assertIdle();
-      return op();
+      return op(gate);
     });
   }
 }
@@ -436,6 +484,7 @@ function publishPage(page: AgentPage): PageApi {
     locator: (selector) => page.locator(selector),
     goto: (url, options) => page.goto(url, options),
     content: (options) => page.content(options),
+    snapshot: (options) => page.snapshot(options),
     close: () => page.close()
   };
 }
@@ -536,9 +585,6 @@ class AgentSession {
 }
 
 const sessions = new Map<string, AgentSession>();
-// Native stage writes this before the first renderer for that partition starts.
-// close() must not delete entries. This checkpoint never writes the map.
-const appliedPersonaIds = new Map<string, string>();
 
 function createSession(options: { partition: unknown; persist?: unknown; persona?: unknown }): SessionApi {
   const decision = decidePersona(options.persona);
@@ -554,13 +600,9 @@ function createSession(options: { partition: unknown; persist?: unknown; persona
   const resolved = resolvePartition(options);
   const existing = sessions.get(resolved.storagePartition);
   const reuse = checkPartitionReuse(
-    partitionRecordForReuse(
-      existing && !existing.isClosed
-        ? { persist: existing.persist, personaApplied: existing.personaApplied, personaId: existing.personaId }
-        : undefined,
-      appliedPersonaIds.get(resolved.storagePartition),
-      resolved.persist
-    ),
+    existing && !existing.isClosed
+      ? { persist: existing.persist, personaApplied: existing.personaApplied, personaId: existing.personaId }
+      : undefined,
     { ...resolved, personaId: null }
   );
   if (reuse === 'reuse' && existing) return existing.api;

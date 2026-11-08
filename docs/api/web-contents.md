@@ -1827,6 +1827,39 @@ The page is considered visible when its browser window is hidden and the capture
 If you would like the page to stay hidden, you should ensure that `stayHidden` is set to true.
 The image has the page's device scale factor (for offscreen rendering, `webPreferences.offscreen.deviceScaleFactor`), so `image.getSize()` is in DIPs and `image.toBitmap()` holds the full-resolution pixels.
 
+#### `contents.captureAccessibilitySnapshot([options])`
+
+<!--
+```YAML history
+added:
+  - pr-url: https://github.com/oceanDeep512/electron/pull/1
+    description: "Added a one-shot accessibility tree snapshot."
+```
+-->
+
+* `options` Object (optional)
+  * `maxNodes` Integer (optional) - Maximum number of nodes requested from Chromium. Default is `2000`. Must be from 1 to 100000.
+  * `timeoutMs` Integer (optional) - Passed to Chromium as the snapshot timeout. Default is `10000`. Must be from 1 to 120000.
+  * `framePolicy` string (optional) - `all` or `same-origin`. Default is `all`.
+
+Returns `Promise<Object>` - The combined accessibility tree from `WebContents::RequestAXTreeSnapshot`. The promise resolves with:
+
+* `rootId` Integer - Root node id, or `0` when the tree is empty.
+* `focusId` Integer - Focused node id from tree data, or `0` when there is none.
+* `url` string - URL from the root tree data.
+* `title` string - Title from the root tree data.
+* `framePolicy` string - `all` or `same-origin`.
+* `maxNodes` Integer - The limit that was requested.
+* `nodes` [AccessibilityTreeNode[]](structures/accessibility-tree-node.md)
+
+This method calls `content::WebContents::RequestAXTreeSnapshot` once. It does not change the accessibility mode, does not enable a native accessibility client, and does not use the debugger. The mode passed is web-contents properties plus extended properties. Chromium removes inline text boxes from snapshots.
+
+`framePolicy: 'all'` maps to `AXTreeSnapshotPolicy::kAll`. `framePolicy: 'same-origin'` maps to `kSameOriginDirectDescendants`, which prunes a frame that crosses an origin, site, or fenced-frame boundary and does not resume under that frame.
+
+The callback copies the `AXTreeUpdate` before it returns. A destroyed page, a crashed renderer, or a cross-document main-frame navigation rejects the promise. A same-document navigation does not. An `about:` navigation, including the initial `about:blank` document, does not. A second call while one snapshot is still running rejects with an already-in-progress error. Chromium may return a partial tree when its timeout fires; that still resolves rather than rejecting.
+
+`agentRuntime` page `snapshot()` adds parent links and resolved bounds on top of this object. This method returns the raw combined tree only.
+
 #### `contents.isBeingCaptured()`
 
 Returns `boolean` - Whether this page is being captured. It returns true when the capturer count

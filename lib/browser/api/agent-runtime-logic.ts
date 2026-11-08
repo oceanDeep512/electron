@@ -14,7 +14,9 @@ export const checkpoint = Object.freeze({
   maxTimeoutMs: 120_000,
   controlPlane: true,
   nativePersona: false,
-  accessibilitySnapshot: false,
+  // The snapshot API is wired to WebContents::RequestAXTreeSnapshot.
+  // HTTP response bodies and WebSocket message bodies are not.
+  accessibilitySnapshot: true,
   responseBodyObservation: false,
   webSocketMessageObservation: false
 } as const);
@@ -44,6 +46,8 @@ export type AgentErrorCode =
   | 'invalid-timeout'
   | 'invalid-zoom'
   | 'invalid-size'
+  | 'invalid-snapshot'
+  | 'snapshot-failed'
   | 'page-script-failed';
 
 export class AgentRuntimeError extends Error {
@@ -117,22 +121,6 @@ export interface PartitionRecord {
   personaId: string | null;
 }
 
-export function partitionRecordForReuse(
-  live: PartitionRecord | undefined,
-  reservedPersonaId: string | undefined,
-  persist: boolean
-): PartitionRecord | undefined {
-  if (live && reservedPersonaId !== undefined && live.personaId !== reservedPersonaId) {
-    throw new AgentRuntimeError(
-      'partition-conflict',
-      'The open session does not match the persona recorded for this partition'
-    );
-  }
-  if (live) return live;
-  if (reservedPersonaId === undefined) return undefined;
-  return { persist, personaApplied: true, personaId: reservedPersonaId };
-}
-
 export function checkPartitionReuse(
   existing: PartitionRecord | undefined,
   next: ResolvedPartition & { personaId: string | null }
@@ -148,6 +136,8 @@ export function checkPartitionReuse(
   return 'reuse';
 }
 
+// Canonical JSON for a later native stage. createSession does not call this
+// and does not store the result.
 export function personaStorageId(persona: Persona): string {
   return JSON.stringify(persona);
 }
@@ -386,8 +376,12 @@ export function validatePersona(value: unknown): PersonaValidation {
       'colorDepth',
       'deviceScaleFactor'
     ]);
+    const screenRecord = value.screen;
     const dims = ['width', 'height', 'availWidth', 'availHeight'] as const;
-    const okDims = dims.every((key) => Number.isInteger(value.screen?.[key]) && (value.screen?.[key] as number) > 0 && (value.screen?.[key] as number) <= 16384);
+    const okDims = dims.every((key) => {
+      const dimension = screenRecord[key];
+      return typeof dimension === 'number' && Number.isInteger(dimension) && dimension > 0 && dimension <= 16384;
+    });
     if (!okDims) errors.push('screen dimensions must be positive integers up to 16384');
     if (!COLOR_DEPTHS.has(value.screen.colorDepth as number)) errors.push('screen.colorDepth is not a supported depth');
     if (typeof value.screen.deviceScaleFactor !== 'number' || !(value.screen.deviceScaleFactor > 0) || value.screen.deviceScaleFactor > 8) {
@@ -799,4 +793,407 @@ export function readContentResult(value: unknown, maxChars: number): { html: str
   const truncated = value.truncated === true || value.html.length > maxChars || value.length > value.html.length;
   const html = value.html.length > maxChars ? value.html.slice(0, maxChars) : value.html;
   return { html, truncated, length: value.length };
+}
+
+// net::ERR_ABORTED. loadURL can report this for an about:blank start that
+// was attached to the new promise and then replaced. It is not, by itself,
+// the caller's navigation failing.
+export const NET_ERR_ABORTED = -3;
+
+export interface NavigationState {
+  readonly phase: 'pending' | 'armed' | 'committed' | 'settled';
+  readonly requestedUrl: string;
+  readonly status: NavigationStatus;
+  readonly outcome: NavigationOutcome | null;
+}
+
+export type NavigationOutcome =
+  | { readonly type: 'success'; readonly url: string; readonly status: NavigationStatus }
+  | { readonly type: 'failure'; readonly code: AgentErrorCode; readonly message: string };
+
+export type NavigationEvent =
+  | { type: 'start'; isMainFrame: boolean; isSameDocument: boolean; url: string }
+  | { type: 'commit'; url: string; httpResponseCode: unknown; httpStatusText: unknown }
+  | { type: 'finish-load'; url: string }
+  | { type: 'fail'; errorCode: unknown; errorDescription: unknown; validatedURL: unknown; isMainFrame: unknown }
+  | { type: 'load-rejected'; errno: number | null; message: string }
+  | { type: 'timeout'; timeoutMs: number }
+  | { type: 'abort' }
+  | { type: 'destroyed' }
+  | { type: 'crashed' };
+
+export function createNavigation(requestedUrl: string): NavigationState {
+  return {
+    phase: 'pending',
+    requestedUrl,
+    status: httpStatusFromNavigateEvent(undefined, undefined),
+    outcome: null
+  };
+}
+
+function settleNavigation(state: NavigationState, code: AgentErrorCode, message: string): NavigationState {
+  return { ...state, phase: 'settled', outcome: { type: 'failure', code, message } };
+}
+
+// Success requires a main-frame cross-document start, then a commit, then
+// did-finish-load. A resolved loadURL promise is not an event and is not a
+// status. Redirects update the commit. A second cross-document main-frame
+// start fails the attempt instead of adopting the new load.
+export function applyNavigationEvent(state: NavigationState, event: NavigationEvent): NavigationState {
+  if (state.outcome) return state;
+  switch (event.type) {
+    case 'start': {
+      if (!shouldArmNavigation(event)) return state;
+      if (state.phase === 'pending') {
+        return { ...state, phase: 'armed', status: httpStatusFromNavigateEvent(undefined, undefined) };
+      }
+      return settleNavigation(
+        state,
+        'navigation-failed',
+        `A different main-frame navigation started for ${safeUrlForError(event.url)}`
+      );
+    }
+    case 'commit': {
+      if (state.phase !== 'armed' && state.phase !== 'committed') return state;
+      return {
+        ...state,
+        phase: 'committed',
+        status: httpStatusFromNavigateEvent(event.httpResponseCode, event.httpStatusText)
+      };
+    }
+    case 'finish-load': {
+      if (state.phase !== 'committed') return state;
+      return {
+        ...state,
+        phase: 'settled',
+        outcome: {
+          type: 'success',
+          url: event.url.length > 0 ? event.url : state.requestedUrl,
+          status: state.status
+        }
+      };
+    }
+    case 'fail': {
+      if (event.isMainFrame === false) return state;
+      if (isForeignFailureUrl(event.validatedURL, state.requestedUrl)) return state;
+      const code = typeof event.errorCode === 'number' && Number.isInteger(event.errorCode) ? event.errorCode : 0;
+      // A pre-arm ERR_ABORTED is the about:blank promise race. A real abort
+      // after arm, and any other code before arm (including ERR_INVALID_URL),
+      // is a known failure and must not wait out the timeout.
+      if (state.phase === 'pending' && code === NET_ERR_ABORTED) return state;
+      const description = typeof event.errorDescription === 'string' && event.errorDescription.length > 0
+        ? event.errorDescription
+        : 'navigation failed';
+      return settleNavigation(
+        state,
+        'navigation-failed',
+        `${description} (${code}) for ${safeUrlForError(state.requestedUrl)}`
+      );
+    }
+    case 'load-rejected': {
+      if (event.errno === NET_ERR_ABORTED) return state;
+      const detail = event.message.length > 0 ? event.message : 'loadURL failed';
+      const suffix = event.errno === null ? '' : ` (${event.errno})`;
+      return settleNavigation(
+        state,
+        'navigation-failed',
+        `${detail}${suffix} for ${safeUrlForError(state.requestedUrl)}`
+      );
+    }
+    case 'timeout':
+      return settleNavigation(
+        state,
+        'timeout',
+        `Navigation timed out after ${event.timeoutMs}ms for ${safeUrlForError(state.requestedUrl)}`
+      );
+    case 'abort':
+      return settleNavigation(state, 'aborted', 'The navigation was aborted');
+    case 'destroyed':
+      return settleNavigation(state, 'destroyed', 'The page was destroyed during navigation');
+    case 'crashed':
+      return settleNavigation(state, 'crashed', 'The renderer crashed during navigation');
+    default:
+      return state;
+  }
+}
+
+export function readLoadRejection(error: unknown): { errno: number | null; message: string } {
+  if (!isRecord(error)) return { errno: null, message: 'loadURL failed' };
+  const errno = typeof error.errno === 'number' && Number.isInteger(error.errno) ? error.errno : null;
+  const message = typeof error.message === 'string' && error.message.length > 0 ? error.message : 'loadURL failed';
+  return { errno, message };
+}
+
+export interface ListenerSet {
+  add(unsubscribe: () => void): void;
+  close(): void;
+}
+
+export function createListenerSet(): ListenerSet {
+  const items: Array<() => void> = [];
+  let closed = false;
+  return {
+    add(unsubscribe) {
+      if (closed) {
+        unsubscribe();
+        return;
+      }
+      items.push(unsubscribe);
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      const pending = items.splice(0);
+      for (const unsubscribe of pending) unsubscribe();
+    }
+  };
+}
+
+export interface EffectGate {
+  settled: boolean;
+}
+
+export function createEffectGate(): EffectGate {
+  return { settled: false };
+}
+
+export function settleEffectGate(gate: EffectGate): void {
+  gate.settled = true;
+}
+
+export function hostEffectAllowed(gate: EffectGate): boolean {
+  return !gate.settled;
+}
+
+// Returns false when a timeout, abort, close, or crash already settled the
+// operation. The action is then not run, so a late page-script result cannot
+// send input.
+export function performHostEffect(gate: EffectGate, effect: () => void): boolean {
+  if (gate.settled) return false;
+  effect();
+  return true;
+}
+
+export const SNAPSHOT_DEFAULT_MAX_NODES = 2000;
+export const SNAPSHOT_DEFAULT_TIMEOUT_MS = 10_000;
+export const SNAPSHOT_MAX_NODES = 100_000;
+
+export function assertSnapshotOptions(options: {
+  maxNodes?: unknown;
+  timeoutMs?: unknown;
+  framePolicy?: unknown;
+}): { maxNodes: number; timeoutMs: number; framePolicy: 'all' | 'same-origin' } {
+  const maxNodes = options.maxNodes === undefined ? SNAPSHOT_DEFAULT_MAX_NODES : options.maxNodes;
+  if (typeof maxNodes !== 'number' || !Number.isInteger(maxNodes) || maxNodes < 1 || maxNodes > SNAPSHOT_MAX_NODES) {
+    throw new AgentRuntimeError('invalid-snapshot', `maxNodes must be an integer from 1 to ${SNAPSHOT_MAX_NODES}`);
+  }
+  const timeoutMs = assertTimeoutMs(options.timeoutMs, SNAPSHOT_DEFAULT_TIMEOUT_MS);
+  const framePolicy = options.framePolicy === undefined ? 'all' : options.framePolicy;
+  if (framePolicy !== 'all' && framePolicy !== 'same-origin') {
+    throw new AgentRuntimeError('invalid-snapshot', "framePolicy must be 'all' or 'same-origin'");
+  }
+  return { maxNodes, timeoutMs, framePolicy };
+}
+
+export interface AXBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface AXNode {
+  id: number;
+  role: string;
+  name: string;
+  parentId: number | null;
+  childIds: number[];
+  ignored: boolean;
+  relativeBounds: AXBounds;
+  offsetContainerId: number;
+  hasTransform: boolean;
+  boundsSpace: 'containing-node' | 'tree-root' | 'offset-container';
+  // Null when a transform is present on the offset chain or the chain cycles.
+  // Otherwise this is the sum of relative bounds, in the root's containing-node
+  // space. It is not a screen point and it is not widget DIP.
+  resolvedBounds: AXBounds | null;
+}
+
+export interface AXSnapshot {
+  rootId: number | null;
+  focusId: number | null;
+  url: string;
+  title: string;
+  framePolicy: 'all' | 'same-origin';
+  maxNodes: number;
+  nodeCount: number;
+  // True only when the returned node count reached maxNodes. Chromium can
+  // also return a shorter tree when its snapshot timeout fires, without a
+  // separate flag. This boolean does not detect that case.
+  mayBeTruncated: boolean;
+  stitching: 'chromium-ax-tree-combiner';
+  inlineTextBoxes: 'stripped-by-chromium';
+  crossFrameBounds: 'relative-chain-without-transforms';
+  crossOriginStitch: 'linked-when-parent-tree-id-matches';
+  nodes: AXNode[];
+}
+
+interface RawAXNode {
+  id: number;
+  role: string;
+  name: string;
+  childIds: number[];
+  ignored: boolean;
+  bounds: AXBounds;
+  offsetContainerId: number;
+  hasTransform: boolean;
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function integer(value: unknown): number | null {
+  return typeof value === 'number' && Number.isInteger(value) ? value : null;
+}
+
+function readBounds(value: unknown): AXBounds | null {
+  if (!isRecord(value)) return null;
+  const x = finiteNumber(value.x);
+  const y = finiteNumber(value.y);
+  const width = finiteNumber(value.width);
+  const height = finiteNumber(value.height);
+  if (x === null || y === null || width === null || height === null) return null;
+  return { x, y, width, height };
+}
+
+function snapshotFailed(message: string): AgentRuntimeError {
+  return new AgentRuntimeError('snapshot-failed', message);
+}
+
+function addBounds(origin: AXBounds, local: AXBounds): AXBounds {
+  return { x: origin.x + local.x, y: origin.y + local.y, width: local.width, height: local.height };
+}
+
+// Walks AXRelativeBounds the way Chromium describes them. An offset container
+// of 0 means "relative to the tree root" for every node except the root,
+// whose box is relative to a container outside this tree. Transforms are not
+// flattened.
+function resolveAXBounds(
+  id: number,
+  nodes: ReadonlyMap<number, RawAXNode>,
+  rootId: number | null,
+  memo: Map<number, AXBounds | null>,
+  stack: Set<number>
+): AXBounds | null {
+  if (memo.has(id)) return memo.get(id) ?? null;
+  const node = nodes.get(id);
+  if (!node || stack.has(id) || node.hasTransform) {
+    memo.set(id, null);
+    return null;
+  }
+  stack.add(id);
+  let resolved: AXBounds | null = null;
+  if (node.offsetContainerId > 0) {
+    const origin = resolveAXBounds(node.offsetContainerId, nodes, rootId, memo, stack);
+    if (origin) resolved = addBounds(origin, node.bounds);
+  } else if (rootId !== null && id !== rootId) {
+    const origin = resolveAXBounds(rootId, nodes, rootId, memo, stack);
+    if (origin) resolved = addBounds(origin, node.bounds);
+  } else {
+    resolved = { x: node.bounds.x, y: node.bounds.y, width: node.bounds.width, height: node.bounds.height };
+  }
+  stack.delete(id);
+  memo.set(id, resolved);
+  return resolved;
+}
+
+export function assembleAXSnapshot(value: unknown): AXSnapshot {
+  if (!isRecord(value)) throw snapshotFailed('Accessibility snapshot was not an object');
+  const framePolicy = value.framePolicy === 'all' || value.framePolicy === 'same-origin' ? value.framePolicy : null;
+  if (!framePolicy) throw snapshotFailed("framePolicy must be 'all' or 'same-origin'");
+  const maxNodes = integer(value.maxNodes);
+  if (maxNodes === null || maxNodes < 1) throw snapshotFailed('maxNodes must be a positive integer');
+  if (typeof value.url !== 'string' || typeof value.title !== 'string') {
+    throw snapshotFailed('url and title must be strings');
+  }
+  const rootId = value.rootId === null || value.rootId === 0 ? null : integer(value.rootId);
+  if (value.rootId !== null && value.rootId !== 0 && rootId === null) throw snapshotFailed('rootId must be an integer or null');
+  const focusId = value.focusId === null || value.focusId === 0 ? null : integer(value.focusId);
+  if (value.focusId !== null && value.focusId !== 0 && focusId === null) throw snapshotFailed('focusId must be an integer or null');
+  if (!Array.isArray(value.nodes)) throw snapshotFailed('nodes must be an array');
+
+  const rawNodes: RawAXNode[] = [];
+  const byId = new Map<number, RawAXNode>();
+  for (const entry of value.nodes) {
+    if (!isRecord(entry)) throw snapshotFailed('A snapshot node was not an object');
+    const id = integer(entry.id);
+    const bounds = readBounds(entry.bounds);
+    const offsetContainerId = integer(entry.offsetContainerId);
+    if (id === null || bounds === null || offsetContainerId === null) {
+      throw snapshotFailed('A snapshot node is missing id, bounds, or offsetContainerId');
+    }
+    if (typeof entry.role !== 'string' || typeof entry.name !== 'string' || typeof entry.ignored !== 'boolean' || typeof entry.hasTransform !== 'boolean') {
+      throw snapshotFailed('A snapshot node is missing role, name, ignored, or hasTransform');
+    }
+    if (!Array.isArray(entry.childIds) || entry.childIds.some((child) => integer(child) === null)) {
+      throw snapshotFailed('childIds must be an array of integers');
+    }
+    if (byId.has(id)) throw snapshotFailed(`Duplicate accessibility node id ${id}`);
+    const node: RawAXNode = {
+      id,
+      role: entry.role,
+      name: entry.name,
+      childIds: entry.childIds as number[],
+      ignored: entry.ignored,
+      bounds,
+      offsetContainerId,
+      hasTransform: entry.hasTransform
+    };
+    rawNodes.push(node);
+    byId.set(id, node);
+  }
+
+  const parentOf = new Map<number, number>();
+  for (const node of rawNodes) {
+    for (const childId of node.childIds) {
+      if (!parentOf.has(childId)) parentOf.set(childId, node.id);
+    }
+  }
+  const memo = new Map<number, AXBounds | null>();
+  const nodes: AXNode[] = rawNodes.map((node) => {
+    let boundsSpace: AXNode['boundsSpace'];
+    if (node.offsetContainerId > 0) boundsSpace = 'offset-container';
+    else if (rootId !== null && node.id !== rootId) boundsSpace = 'tree-root';
+    else boundsSpace = 'containing-node';
+    return {
+      id: node.id,
+      role: node.role,
+      name: node.name,
+      parentId: parentOf.get(node.id) ?? null,
+      childIds: [...node.childIds],
+      ignored: node.ignored,
+      relativeBounds: node.bounds,
+      offsetContainerId: node.offsetContainerId,
+      hasTransform: node.hasTransform,
+      boundsSpace,
+      resolvedBounds: resolveAXBounds(node.id, byId, rootId, memo, new Set())
+    };
+  });
+
+  return {
+    rootId,
+    focusId,
+    url: value.url,
+    title: value.title,
+    framePolicy,
+    maxNodes,
+    nodeCount: nodes.length,
+    mayBeTruncated: nodes.length >= maxNodes,
+    stitching: 'chromium-ax-tree-combiner',
+    inlineTextBoxes: 'stripped-by-chromium',
+    crossFrameBounds: 'relative-chain-without-transforms',
+    crossOriginStitch: 'linked-when-parent-tree-id-matches',
+    nodes
+  };
 }

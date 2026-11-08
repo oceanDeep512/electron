@@ -1,68 +1,18 @@
-import { BrowserWindow } from 'electron/main';
+import { agentRuntime, BrowserWindow } from 'electron/main';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { createRequire } from 'node:module';
 import * as http from 'node:http';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { closeAllWindows } from './lib/window-helpers.ts';
 
-const agentRuntime = (createRequire(import.meta.url)('electron') as { agentRuntime: AgentRuntime }).agentRuntime;
-
 const fixturePage = path.join(import.meta.dirname, 'fixtures', 'agent-runtime', 'page.html');
 const fixturePreload = path.join(import.meta.dirname, 'fixtures', 'agent-runtime', 'preload.js');
 const fixtureUrl = pathToFileURL(fixturePage).href;
 
-interface AgentPage {
-  readonly adopted: boolean;
-  readonly webContents: Electron.WebContents;
-  locator(selector: string): AgentLocator;
-  goto(url: string, options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<{
-    url: string;
-    httpStatus: number | null;
-    httpStatusText: string;
-    httpStatusSource: string;
-  }>;
-  content(options?: { maxChars?: number }): Promise<{ html: string; truncated: boolean; length: number }>;
-  close(): void;
-}
-
-interface AgentLocator {
-  boundingBox(): Promise<{ width: number; height: number }>;
-  click(): Promise<void>;
-  fill(text: string): Promise<void>;
-  press(key: string): Promise<void>;
-  inputValue(): Promise<string>;
-}
-
-interface AgentSession {
-  readonly personaApplied: boolean;
-  readonly personaId: string | null;
-  readonly persist: boolean;
-  readonly storagePartition: string;
-  readonly isClosed: boolean;
-  readonly session: Electron.Session;
-  createPage(options?: { webContents?: Electron.WebContents; show?: boolean; width?: number; height?: number }): AgentPage;
-  close(): void;
-}
-
-interface AgentRuntime {
-  checkpoint: {
-    controlPlane: boolean;
-    nativePersona: boolean;
-    accessibilitySnapshot: boolean;
-    responseBodyObservation: boolean;
-    webSocketMessageObservation: boolean;
-    baseline: string;
-  };
-  createSession(options: { partition: string; persist?: boolean; persona?: unknown }): AgentSession;
-  resolvePartition(options: { partition: string; persist?: boolean }): { storagePartition: string };
-  validatePersona(value: unknown): { ok: boolean };
-  snapshot?: unknown;
-  observe?: unknown;
-}
+type AgentSession = ReturnType<typeof agentRuntime.createSession>;
 
 const openSessions: AgentSession[] = [];
 
@@ -153,12 +103,12 @@ describe('agentRuntime checkpoint', () => {
   it('exposes the control plane and does not export native observation', () => {
     expect(agentRuntime.checkpoint.controlPlane).toBe(true);
     expect(agentRuntime.checkpoint.nativePersona).toBe(false);
-    expect(agentRuntime.checkpoint.accessibilitySnapshot).toBe(false);
+    expect(agentRuntime.checkpoint.accessibilitySnapshot).toBe(true);
     expect(agentRuntime.checkpoint.responseBodyObservation).toBe(false);
     expect(agentRuntime.checkpoint.webSocketMessageObservation).toBe(false);
     expect(agentRuntime.checkpoint.baseline).toBe('ef2710fa6c10fe56365a9949fa783d26ca1499e5');
-    expect(agentRuntime.snapshot).toBeUndefined();
-    expect(agentRuntime.observe).toBeUndefined();
+    expect('snapshot' in agentRuntime).toBe(false);
+    expect('observe' in agentRuntime).toBe(false);
   });
 
   it('rejects an empty partition before attaching to the default session', () => {
@@ -334,6 +284,35 @@ describe('agentRuntime navigation', () => {
       await server.close();
     }
   });
+
+  it('rejects an unreachable URL instead of spending the full timeout', async () => {
+    const page = createSession().createPage();
+    const started = Date.now();
+    await expect(page.goto('http://127.0.0.1:1/', { timeoutMs: 5000 })).rejects.toMatchObject({ code: 'navigation-failed' });
+    expect(Date.now() - started).toBeLessThan(4000);
+  });
+
+  it('fails the attempt when a different main-frame navigation starts', async () => {
+    const server = await listen(() => undefined);
+    try {
+      const page = createSession().createPage();
+      const started = new Promise<void>((resolve) => {
+        const onStart = (details: Electron.Event & { url: string; isMainFrame: boolean }) => {
+          if (details.isMainFrame && details.url.includes('/slow')) {
+            page.webContents.removeListener('did-start-navigation', onStart);
+            resolve();
+          }
+        };
+        page.webContents.on('did-start-navigation', onStart);
+      });
+      const pending = page.goto(`${server.origin}/slow`, { timeoutMs: 5000 });
+      await started;
+      await page.webContents.loadURL('data:text/html,other');
+      await expect(pending).rejects.toMatchObject({ code: 'navigation-failed' });
+    } finally {
+      await server.close();
+    }
+  });
 });
 
 describe('agentRuntime locator', () => {
@@ -360,5 +339,70 @@ describe('agentRuntime locator', () => {
     const html = await page.content();
     expect(html).toContain('clicked');
     expect(page.webContents.debugger.isAttached()).toBe(false);
+  });
+});
+
+describe('agentRuntime accessibility snapshot', () => {
+  it('rejects invalid limits before calling into the page', async () => {
+    const page = createSession().createPage();
+    await expect(page.snapshot({ maxNodes: 0 })).rejects.toMatchObject({ code: 'invalid-snapshot' });
+    await expect(page.snapshot({ framePolicy: 'all' })).resolves.toMatchObject({
+      framePolicy: 'all',
+      stitching: 'chromium-ax-tree-combiner',
+      inlineTextBoxes: 'stripped-by-chromium'
+    });
+    expect(page.webContents.debugger.isAttached()).toBe(false);
+  });
+
+  it('does not resolve a snapshot after close, and rejects a crashed page', async () => {
+    const closing = createSession().createPage();
+    const pending = closing.snapshot({ timeoutMs: 5000 });
+    closing.close();
+    await expect(pending).rejects.toMatchObject({ code: 'closed' });
+
+    const crashed = createSession().createPage();
+    await crashed.goto('data:text/html,<button>Go</button>');
+    await new Promise<void>((resolve) => {
+      crashed.webContents.once('render-process-gone', () => resolve());
+      crashed.webContents.forcefullyCrashRenderer();
+    });
+    await expect(crashed.snapshot()).rejects.toMatchObject({ code: 'crashed' });
+  });
+
+  it('returns same-origin names and omits a cross-origin frame when asked', async () => {
+    const foreign = await listen((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      res.end('<!doctype html><button>Cross Child</button>');
+    });
+    const main = await listen((req, res) => {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+      if (req.url === '/child') {
+        res.end('<!doctype html><button>Same Child</button>');
+        return;
+      }
+      res.end(`<!doctype html><title>Snapshot</title><button>Main Go</button><iframe src="/child"></iframe><iframe src="${foreign.origin}/"></iframe>`);
+    });
+    try {
+      const page = createSession().createPage();
+      await page.goto(`${main.origin}/`);
+      const same = await page.snapshot({ framePolicy: 'same-origin' });
+      expect(same.framePolicy).toBe('same-origin');
+      expect(same.crossOriginStitch).toBe('linked-when-parent-tree-id-matches');
+      expect(same.nodes.some((node) => node.name === 'Main Go')).toBe(true);
+      expect(same.nodes.some((node) => node.name === 'Same Child')).toBe(true);
+      expect(same.nodes.some((node) => node.name === 'Cross Child')).toBe(false);
+      expect(page.webContents.debugger.isAttached()).toBe(false);
+
+      const all = await page.snapshot({ framePolicy: 'all' });
+      expect(all.framePolicy).toBe('all');
+      expect(all.nodes.some((node) => node.name === 'Main Go')).toBe(true);
+      expect(all.crossFrameBounds).toBe('relative-chain-without-transforms');
+      const button = all.nodes.find((node) => node.name === 'Main Go');
+      expect(button?.role.length).toBeGreaterThan(0);
+      expect(button?.parentId === null || typeof button?.parentId === 'number').toBe(true);
+    } finally {
+      await main.close();
+      await foreign.close();
+    }
   });
 });

@@ -1,6 +1,6 @@
 # Agent Runtime
 
-This page records the first checkpoint of the agent runtime. It is a main-process control plane. Native fingerprint persona, accessibility snapshots, HTTP response bodies, and WebSocket message bodies are not implemented.
+This page records the second checkpoint of the agent runtime. The main-process control plane is repaired, and `page.snapshot()` reads Chromium's accessibility tree. Native fingerprint persona, HTTP response bodies, and WebSocket message bodies are still not implemented.
 
 ## Status of this checkpoint
 
@@ -8,14 +8,15 @@ This page records the first checkpoint of the agent runtime. It is a main-proces
 | --- | --- |
 | Design record and baseline pin | Written on this page |
 | `agentRuntime` session and page control plane | Implemented in the main process |
+| Public docs and generated TypeScript surface | `docs/api/agent-runtime.md` and `webContents.captureAccessibilitySnapshot` |
 | Navigation, locator, and input without CDP | Implemented, with the boundaries below |
 | Persona config validation | Implemented as a pure check |
 | Applying a fingerprint persona | Not implemented. `createSession` rejects a persona |
-| Accessibility snapshot | Not exported |
-| HTTP response body observation | Not exported |
-| WebSocket message body observation | Not exported |
+| Accessibility snapshot | Wired to `WebContents::RequestAXTreeSnapshot` |
+| HTTP response body observation | Not implemented |
+| WebSocket message body observation | Not implemented |
 
-`electron.agentRuntime.checkpoint` exposes the same flags at runtime. `nativePersona`, `accessibilitySnapshot`, `responseBodyObservation`, and `webSocketMessageObservation` are false.
+`electron.agentRuntime.checkpoint` exposes the same flags at runtime. `accessibilitySnapshot` is true. `nativePersona`, `responseBodyObservation`, and `webSocketMessageObservation` are false.
 
 ## Pinned baseline
 
@@ -50,11 +51,11 @@ Passing an existing `webContents` to `createPage` adopts that page. It does not 
 
 `session.close()` closes those handles and drops the in-memory session record. It does not delete the Chromium storage partition. A later `createSession` for the same partition creates a new handle around the same Electron session.
 
-There is no `snapshot` or `observe` method. Debugger and CDP are not used. `webContents.debugger.attach` is not called.
+`page.snapshot()` is the accessibility API. There is no `observe` method. Debugger and CDP are not used. `webContents.debugger.attach` is not called.
 
 Page scripts run in isolated world `1001`. World `0` is the page world. World `999` is Electron context isolation. Selector text and script arguments are passed with `JSON.stringify`. Fill text is sent with `webContents.insertText` and is not concatenated into JavaScript source.
 
-At most four operations wait on one page. A fifth fails with `busy`. A timeout stops waiting. `executeJavaScriptInIsolatedWorld` itself cannot be cancelled, so a timed-out script may still finish in the page. Navigation timeout and abort call `webContents.stop()`.
+At most four operations wait on one page. A fifth fails with `busy`. A timeout stops waiting and settles an effect gate before the caller is rejected. `executeJavaScriptInIsolatedWorld` itself cannot be cancelled, so a timed-out script may still finish in the page. The slot is released so the next operation can start. `click`, `fill`, and `press` call `performHostEffect` and do not send input after that gate is settled. Navigation timeout and abort call `webContents.stop()` only after the navigation outcome is already timeout or aborted.
 
 The registry that remembers open sessions is main-process bookkeeping. It is not a process-wide Chromium preference, user-agent override, timezone, or command-line switch. Per-session data stays on the partition's `Session` and on the handle.
 
@@ -66,17 +67,17 @@ The registry that remembers open sessions is main-process bookkeeping. It is not
 
 `validatePersona` only checks the shape of a future persona. A successful result means the object is well formed. It does not change a renderer, the network stack, Client Hints, timezone, WebGL, canvas, audio, fonts, or WebRTC. `createSession` with a persona object fails with `native-persona-unavailable` before `session.fromPartition`, so a rejected persona does not reserve the partition. `persona: null` is invalid. Omit the property to create a normal session.
 
-The future native stage must apply a persona before the first renderer for that partition starts, including service workers, and must keep it immutable for the life of the partition. `personaStorageId` is the canonical JSON of a validated persona. `partitionRecordForReuse` treats a recorded id as still reserved after `session.close()`, because closing the handle does not rebuild the `BrowserContext`. This checkpoint never writes that reservation. Two open handles may share a partition only when persistence matches and both persona ids are null.
+The future native stage must apply a persona before the first renderer for that partition starts, including service workers, and must keep it immutable for the life of the partition. `personaStorageId` is the canonical JSON of a validated persona. `createSession` does not call it and does not keep a persona map. Two open handles may share a partition only when persistence matches and both persona ids are null.
 
 `fontPolicy: "core"` can pass validation. It is still not applied. The native stage must reject that policy if it cannot be implemented honestly.
 
 ## Navigation
 
-`page.goto` accepts only `http:`, `https:`, `file:`, and `data:` URLs. A second `goto` while one is in progress fails with `navigation-in-progress`. Locator and `content` calls also fail with that code until the navigation settles. Destroyed, crashed, and closed pages reject new work. `AbortSignal` and the timeout stop the load.
+`page.goto` accepts only `http:`, `https:`, `file:`, and `data:` URLs. A second `goto` while one is in progress fails with `navigation-in-progress`. Locator, `content`, and `snapshot` calls also fail with that code until the navigation settles. Destroyed, crashed, and closed pages reject new work. `AbortSignal` and the timeout stop the load.
 
-HTTP status is copied from `did-navigate` or a main-frame `did-frame-navigate` only after this call has seen its own main-frame `did-start-navigation`. Codes outside 100 through 599, including the non-HTTP value `-1`, become `httpStatus: null` and `httpStatusSource: "unavailable"`. `loadURL` does not supply a status, and this API never substitutes 200. `data:` and `file:` navigations therefore report an unavailable status.
+HTTP status is copied from `did-navigate` or a main-frame `did-frame-navigate` only after this call has armed on its own main-frame cross-document `did-start-navigation`. Codes outside 100 through 599, including the non-HTTP value `-1`, become `httpStatus: null` and `httpStatusSource: "unavailable"`. A resolved `loadURL` promise is not success and is not a status. This API never substitutes 200. `data:` and `file:` navigations therefore report an unavailable status when they commit with a non-HTTP code.
 
-The initial `BrowserWindow` document is `about:blank`. Those start and failure events are ignored so they are not reported as the caller's navigation. Same-document starts are ignored. Subframe navigations are ignored. The result URL is `webContents.getURL()` after the main frame finishes loading.
+The initial `BrowserWindow` document is `about:blank`. Those starts, commits, finishes, and `about:` failures are ignored. `net::ERR_ABORTED` (`-3`) before arm is ignored, because `LoadURL` can attribute that rejection to the initial blank load and then continue the real navigation. Any other `did-fail-load` before arm, including `ERR_INVALID_URL`, fails immediately. A `loadURL` rejection other than `-3`, including `ERR_FAILED` (`-2`) from `DidStopLoading`, also fails immediately. Same-document starts and subframe starts are ignored. A server redirect is not a second start; the later commit carries the final URL and the final HTTP status. A second cross-document main-frame start, including a reload or `webContents.loadURL` from outside this call, fails the attempt and does not report that other load as success. Success still requires arm, then commit, then `did-finish-load`. The result URL is `webContents.getURL()` at finish.
 
 Error strings pass the URL through `safeUrlForError`, which removes username and password.
 
@@ -92,12 +93,21 @@ The click point is the CSS box center multiplied by `webContents.zoomFactor`, th
 
 `fill` is limited to 100000 characters and rejects NUL. `content` defaults to 200000 characters and refuses more than 1000000. The main process truncates again if the page returns a longer string.
 
+## Accessibility snapshot
+
+`page.snapshot()` calls `webContents.captureAccessibilitySnapshot()`, which calls `content::WebContents::RequestAXTreeSnapshot` on Chromium `159.0.8140.0`. The mode is `kWebContents | kExtendedProperties`. `kNativeAPIs` is not set. `app.setAccessibilitySupportEnabled` is not called. The snapshot implementation in Chromium strips inline text boxes. The callback copies the `AXTreeUpdate` into a dictionary and resolves a `gin_helper::Promise`. A weak pointer drops the callback if the native lifecycle is gone. The promise is rejected on destroy, renderer crash, and cross-document main-frame navigation other than `about:`. A second snapshot while one request is stored rejects as already in progress. A JavaScript timeout can therefore leave that native request busy until Chromium's callback returns; the late tree is not given to the caller who already timed out.
+
+`framePolicy: "all"` is `AXTreeSnapshotPolicy::kAll`. `framePolicy: "same-origin"` is `kSameOriginDirectDescendants`. Chromium's `AXTreeCombiner` renumbers ids and links a child tree only when that tree's `parent_tree_id` matches and it has nodes. Frames the snapshotter skipped, unknown tree ids, and parent mismatches are absent. This is Chromium's stitch, not a DOM walk, and it is not a claim of complete cross-frame pixel fidelity.
+
+`resolvedBounds` adds `AXRelativeBounds` along the offset-container chain. An offset of `0` means relative to the tree root, except for the root, whose box is relative to a container outside the tree. A transform or a cycle makes `resolvedBounds` null. Those numbers are not screen coordinates and not widget DIP.
+
+`mayBeTruncated` is true only when the node count reached `maxNodes`. Chromium can also return a shorter tree when its own timeout fires, and that case is not separately flagged.
+
 ## Explicitly not implemented
 
 The following stay out of this checkpoint. They are the next stages, not hidden behavior of the current API.
 
 *   Native persona application, including user agent and Client Hints, locale, timezone, hardware concurrency, device memory, screen, WebGL, WebGPU identity, canvas, audio, fonts, and WebRTC IP policy.
-*   `RequestAXTreeSnapshot` accessibility trees.
 *   Passive HTTP response body capture. The body must be tee'd from the URL loader data pipe on both the direct path and the proxy path, without adding observer backpressure or dropping the pipe before completion.
 *   WebSocket message body capture. Frame metadata and payload bytes are separate, and the current proxy drops the connection endpoints after connect.
 *   Any claim that a persona is undetectable, or that codecs and Widevine are something other than what this build actually contains.
@@ -112,15 +122,26 @@ Pure logic is covered by `script/agent-runtime-logic.test.mts`. It imports the p
 node --experimental-strip-types --test script/agent-runtime-logic.test.mts
 ```
 
-`spec/api-agent-runtime.spec.ts` and `spec/fixtures/agent-runtime/` exercise the registered API inside Electron: partition isolation, adoption, HTTP 201 and 404, non-HTTP status, cancellation, and input. Those specs were not executed in this checkpoint. They must not be described as passed until `e test` runs them.
+`spec/api-agent-runtime.spec.ts` and `spec/fixtures/agent-runtime/` exercise the registered API inside Electron: partition isolation, adoption, HTTP 201 and 404, non-HTTP status, cancellation, input, and accessibility snapshots with a same-origin iframe and a cross-origin iframe. Those specs were not executed in this checkpoint. They must not be described as passed until `e test` runs them. The C++ binding was not compiled.
 
 Not run for this checkpoint, and not claimed:
 
-*   `e sync`, `gclient`, or a Chromium checkout
+*   `e sync`, `gclient`, or a Chromium checkout beyond the pinned public headers that were read for `RequestAXTreeSnapshot`
 *   `e build` or any full Electron build
 *   `e test` or vitest under Electron
-*   `npm run lint`, oxlint, `tsc`, and markdownlint, because `node_modules` is not installed
 
-`filenames.auto.gni` lists the two new library files in the typecheck inputs and the browser bundle inputs. The generator was not run, because it needs the bundler dependencies. A later `node script/gen-filenames.mts` should be checked once those dependencies exist. The order matches the generator's sort: the new files come before `lib/browser/api/app.ts`.
+`filenames.auto.gni` is still produced by `script/gen-filenames.mts`. Running that generator here would drop `node_header_sources`, because `../third_party/electron_node` and `../v8` are not checked out. The browser bundle graph and the `lib/` typecheck list were compared with the generator's own rules instead. `docs/api/agent-runtime.md` is listed with the other API docs.
 
-`docs/api` was not given a public page. API history requires an upstream pull request URL, and `electron.d.ts` is generated from `docs/api`. Specs therefore load `agentRuntime` from the Electron export and declare the local types they use.
+`docs/api-history.schema.json` accepts `https://github.com/oceanDeep512/electron/pull/1` in addition to `electron/electron` pull requests. The history blocks use that fork pull request. No `electron/electron` pull request number was invented. `lint-roller-markdown-api-history` reads that schema and reported 0 errors. A warning in `crash-reporter.md` is pre-existing.
+
+This checkpoint ran:
+
+*   `node --experimental-strip-types --test script/agent-runtime-logic.test.mts` — 18 passed, 0 failed. This executes the production logic module. It is not an Electron runtime test.
+*   `node --experimental-strip-types --check` on the logic module, the runtime module, the logic test, and the spec. That is syntax only, not a typecheck.
+*   `node script/create-api-json.mjs` and `electron-typescript-definitions --api=electron-api.json`. `agentRuntime` and `captureAccessibilitySnapshot` are in the generated JSON and `electron.d.ts`. Those generated files are gitignored.
+*   `node spec/ts-smoke/runner.js` — exit 0. That typechecks `electron.d.ts`.
+*   `tsc -p tsconfig.electron.json` reports no errors in the agent runtime files. The same command exits 1 because `@node/...` imports need `../third_party/electron_node`, which is not checked out.
+*   `tsc -p tsconfig.spec.json` reports no errors in `spec/api-agent-runtime.spec.ts` when `vitest` is stubbed. The real `vitest` package was not installed: `npm install vitest@5` crashed in npm's arborist (`edgesOut`).
+*   `node ./build/bundle/bundle.mjs --target <target> --print-graph` for every bundle target matches `filenames.auto.gni`. `lib_typecheck_sources` matches the generator's `lib/` walk. `script/gen-filenames.mts` itself was not run, because it would also rewrite `node_header_sources` from the missing Node and V8 trees.
+
+oxlint is not installed in this environment. `e build` and `e test` were not run. The C++ snapshot binding is therefore uncompiled, and the Electron specs are unexecuted.

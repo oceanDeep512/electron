@@ -1,6 +1,7 @@
 # THIS FILE IS AUTO-GENERATED, PLEASE DO NOT EDIT BY HAND
 auto_filenames = {
   api_docs = [
+    "docs/api/agent-runtime.md",
     "docs/api/app-shim-host.md",
     "docs/api/app.md",
     "docs/api/auto-updater.md",
@@ -83,7 +84,9 @@ auto_filenames = {
     "docs/api/web-utils.md",
     "docs/api/webview-tag.md",
     "docs/api/window-open.md",
+    "docs/api/structures/accessibility-tree-node.md",
     "docs/api/structures/activation-arguments.md",
+    "docs/api/structures/agent-accessibility-node.md",
     "docs/api/structures/base-window-options.md",
     "docs/api/structures/bluetooth-device.md",
     "docs/api/structures/browser-window-options.md",

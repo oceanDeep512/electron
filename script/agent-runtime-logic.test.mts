@@ -6,30 +6,40 @@ import {
   AgentRuntimeError,
   CONTENT_SCRIPT,
   ELEMENT_SCRIPT,
+  NET_ERR_ABORTED,
+  applyNavigationEvent,
+  assembleAXSnapshot,
   assertClickable,
   assertFillText,
   assertNavigableUrl,
+  assertSnapshotOptions,
   boxCenter,
   buildIsolatedCall,
   checkPartitionReuse,
   checkpoint,
   claimSlot,
+  createEffectGate,
+  createListenerSet,
+  createNavigation,
   cssPointToWidgetDip,
   decidePersona,
   httpStatusFromNavigateEvent,
   isForeignFailureUrl,
   ownedWebPreferences,
-  partitionRecordForReuse,
+  performHostEffect,
   personaStorageId,
   planKey,
   readContentResult,
   readElementResult,
+  readLoadRejection,
   readNavigationStart,
   releaseSlot,
   resolvePartition,
   safeUrlForError,
+  settleEffectGate,
   shouldArmNavigation,
   validatePersona,
+  type NavigationEvent,
   type Persona
 } from '../lib/browser/api/agent-runtime-logic.ts';
 
@@ -79,7 +89,7 @@ test('checkpoint records the pinned baseline and leaves native stages off', () =
   assert.equal(checkpoint.chromium, '159.0.8140.0');
   assert.equal(checkpoint.controlPlane, true);
   assert.equal(checkpoint.nativePersona, false);
-  assert.equal(checkpoint.accessibilitySnapshot, false);
+  assert.equal(checkpoint.accessibilitySnapshot, true);
   assert.equal(checkpoint.responseBodyObservation, false);
   assert.equal(checkpoint.webSocketMessageObservation, false);
   assert.equal(checkpoint.isolatedWorldId, 1001);
@@ -134,20 +144,6 @@ test('an open partition is not reused with a different persona or persistence', 
   );
   assert.throws(
     () => checkPartitionReuse({ persist: false, personaApplied: true, personaId: null }, memory),
-    (error: unknown) => error instanceof AgentRuntimeError && error.code === 'partition-conflict'
-  );
-  const reserved = partitionRecordForReuse(undefined, 'persona-a', false);
-  assert.equal(reserved?.personaApplied, true);
-  assert.throws(
-    () => checkPartitionReuse(reserved, memory),
-    (error: unknown) => error instanceof AgentRuntimeError && error.code === 'partition-conflict'
-  );
-  assert.throws(
-    () => partitionRecordForReuse(
-      { persist: false, personaApplied: false, personaId: null },
-      'persona-a',
-      false
-    ),
     (error: unknown) => error instanceof AgentRuntimeError && error.code === 'partition-conflict'
   );
 });
@@ -351,5 +347,265 @@ test('key plans preserve character case and do not invent a char for Enter', () 
   assert.equal(assertFillText(''), '');
   assert.throws(() => assertFillText('a'.repeat(100_001)), (error: unknown) => {
     return error instanceof AgentRuntimeError && error.code === 'invalid-size';
+  });
+});
+
+function reduce(events: NavigationEvent[]) {
+  let state = createNavigation('https://user:secret@example.test/start');
+  for (const event of events) state = applyNavigationEvent(state, event);
+  return state;
+}
+
+const realStart: NavigationEvent = {
+  type: 'start',
+  isMainFrame: true,
+  isSameDocument: false,
+  url: 'https://example.test/start'
+};
+
+test('navigation waits for its own commit and does not invent an HTTP status', () => {
+  const blank = reduce([
+    { type: 'start', isMainFrame: true, isSameDocument: false, url: 'about:blank' },
+    { type: 'finish-load', url: 'about:blank' },
+    realStart,
+    { type: 'commit', url: 'https://example.test/final', httpResponseCode: 404, httpStatusText: 'Not Found' },
+    { type: 'finish-load', url: 'https://example.test/final' }
+  ]);
+  assert.equal(blank.outcome?.type, 'success');
+  if (blank.outcome?.type !== 'success') return;
+  assert.equal(blank.outcome.url, 'https://example.test/final');
+  assert.equal(blank.outcome.status.httpStatus, 404);
+  assert.equal(blank.outcome.status.httpStatusSource, 'did-navigate');
+
+  const file = reduce([
+    realStart,
+    { type: 'commit', url: 'file:///tmp/a', httpResponseCode: -1, httpStatusText: '' },
+    { type: 'finish-load', url: 'file:///tmp/a' }
+  ]);
+  assert.equal(file.outcome?.type, 'success');
+  if (file.outcome?.type !== 'success') return;
+  assert.equal(file.outcome.status.httpStatus, null);
+  assert.equal(file.outcome.status.httpStatusSource, 'unavailable');
+});
+
+test('a known load failure does not wait for the timeout', () => {
+  const invalid = reduce([
+    { type: 'fail', errorCode: -300, errorDescription: 'ERR_INVALID_URL', validatedURL: '', isMainFrame: true }
+  ]);
+  assert.equal(invalid.outcome?.type, 'failure');
+  if (invalid.outcome?.type !== 'failure') return;
+  assert.equal(invalid.outcome.code, 'navigation-failed');
+  assert.equal(invalid.outcome.message.includes('secret'), false);
+
+  const stopped = reduce([
+    { type: 'load-rejected', errno: -2, message: 'ERR_FAILED (-2) loading \'https://example.test/start\'' }
+  ]);
+  assert.equal(stopped.outcome?.type, 'failure');
+
+  const blankAbort = reduce([
+    { type: 'fail', errorCode: NET_ERR_ABORTED, errorDescription: 'ERR_ABORTED', validatedURL: 'about:blank', isMainFrame: true },
+    { type: 'load-rejected', errno: NET_ERR_ABORTED, message: 'ERR_ABORTED' },
+    realStart,
+    { type: 'commit', url: 'https://example.test/start', httpResponseCode: 204, httpStatusText: 'No Content' },
+    { type: 'finish-load', url: 'https://example.test/start' }
+  ]);
+  assert.equal(blankAbort.outcome?.type, 'success');
+  if (blankAbort.outcome?.type !== 'success') return;
+  assert.equal(blankAbort.outcome.status.httpStatus, 204);
+  assert.equal(readLoadRejection({ errno: NET_ERR_ABORTED, message: 'ERR_ABORTED' }).errno, NET_ERR_ABORTED);
+});
+
+test('redirects commit once and a competing navigation fails the attempt', () => {
+  const redirect = reduce([
+    realStart,
+    { type: 'start', isMainFrame: false, isSameDocument: false, url: 'https://cdn.example.test/frame' },
+    { type: 'start', isMainFrame: true, isSameDocument: true, url: 'https://example.test/start#section' },
+    { type: 'commit', url: 'https://example.test/after', httpResponseCode: 200, httpStatusText: 'OK' },
+    { type: 'finish-load', url: 'https://example.test/after' }
+  ]);
+  assert.equal(redirect.outcome?.type, 'success');
+  if (redirect.outcome?.type !== 'success') return;
+  assert.equal(redirect.outcome.status.httpStatus, 200);
+  assert.equal(redirect.outcome.url, 'https://example.test/after');
+
+  const competing = reduce([
+    realStart,
+    { type: 'start', isMainFrame: true, isSameDocument: false, url: 'https://other.test/' },
+    { type: 'commit', url: 'https://other.test/', httpResponseCode: 200, httpStatusText: 'OK' },
+    { type: 'finish-load', url: 'https://other.test/' }
+  ]);
+  assert.equal(competing.outcome?.type, 'failure');
+  if (competing.outcome?.type !== 'failure') return;
+  assert.equal(competing.outcome.code, 'navigation-failed');
+  assert.equal(competing.outcome.message.includes('other.test'), true);
+
+  const oldFinish = reduce([
+    { type: 'commit', url: 'about:blank', httpResponseCode: -1, httpStatusText: '' },
+    { type: 'finish-load', url: 'about:blank' }
+  ]);
+  assert.equal(oldFinish.outcome, null);
+
+  const timeout = reduce([
+    realStart,
+    { type: 'commit', url: 'https://example.test/start', httpResponseCode: 200, httpStatusText: 'OK' },
+    { type: 'timeout', timeoutMs: 200 },
+    { type: 'finish-load', url: 'https://example.test/start' }
+  ]);
+  assert.equal(timeout.outcome?.type, 'failure');
+  if (timeout.outcome?.type !== 'failure') return;
+  assert.equal(timeout.outcome.code, 'timeout');
+
+  const aborted = reduce([{ type: 'abort' }]);
+  assert.equal(aborted.outcome?.type, 'failure');
+  if (aborted.outcome?.type !== 'failure') return;
+  assert.equal(aborted.outcome.code, 'aborted');
+  const destroyed = reduce([{ type: 'destroyed' }]);
+  assert.equal(destroyed.outcome?.type, 'failure');
+  if (destroyed.outcome?.type !== 'failure') return;
+  assert.equal(destroyed.outcome.code, 'destroyed');
+});
+
+test('a settled gate does not run click, fill, or press after a late script', async () => {
+  const gate = createEffectGate();
+  const effects: string[] = [];
+  assert.equal(performHostEffect(gate, () => { effects.push('early'); }), true);
+  settleEffectGate(gate);
+  let release: (value: string) => void = () => undefined;
+  const script = new Promise<string>((resolve) => {
+    release = resolve;
+  });
+  release('element');
+  const value = await script;
+  if (value === 'element') {
+    performHostEffect(gate, () => { effects.push('click'); });
+    performHostEffect(gate, () => { effects.push('fill'); });
+    performHostEffect(gate, () => { effects.push('press'); });
+  }
+  assert.deepEqual(effects, ['early']);
+
+  const listeners = createListenerSet();
+  const calls: string[] = [];
+  listeners.add(() => { calls.push('destroyed'); });
+  listeners.add(() => { calls.push('abort'); });
+  listeners.close();
+  listeners.close();
+  listeners.add(() => { calls.push('late'); });
+  assert.deepEqual(calls, ['destroyed', 'abort', 'late']);
+});
+
+test('accessibility assembly keeps relationships and refuses transformed bounds', () => {
+  assert.deepEqual(assertSnapshotOptions({}), { maxNodes: 2000, timeoutMs: 10_000, framePolicy: 'all' });
+  assert.throws(() => assertSnapshotOptions({ maxNodes: 0 }), (error: unknown) => {
+    return error instanceof AgentRuntimeError && error.code === 'invalid-snapshot';
+  });
+  assert.throws(() => assertSnapshotOptions({ framePolicy: 'everything' }), (error: unknown) => {
+    return error instanceof AgentRuntimeError && error.code === 'invalid-snapshot';
+  });
+
+  const tree = assembleAXSnapshot({
+    rootId: 1,
+    focusId: 2,
+    url: 'https://example.test/',
+    title: 'Example',
+    framePolicy: 'same-origin',
+    maxNodes: 3,
+    nodes: [
+      {
+        id: 1,
+        role: 'rootWebArea',
+        name: 'Example',
+        childIds: [2],
+        ignored: false,
+        bounds: { x: 10, y: 20, width: 100, height: 50 },
+        offsetContainerId: 0,
+        hasTransform: false
+      },
+      {
+        id: 2,
+        role: 'button',
+        name: 'Same Child',
+        childIds: [],
+        ignored: false,
+        bounds: { x: 5, y: 6, width: 8, height: 9 },
+        offsetContainerId: 1,
+        hasTransform: false
+      },
+      {
+        id: 3,
+        role: 'genericContainer',
+        name: 'Shifted',
+        childIds: [4],
+        ignored: true,
+        bounds: { x: 1, y: 1, width: 4, height: 4 },
+        offsetContainerId: 0,
+        hasTransform: true
+      },
+      {
+        id: 4,
+        role: 'staticText',
+        name: 'Inside',
+        childIds: [],
+        ignored: false,
+        bounds: { x: 2, y: 2, width: 1, height: 1 },
+        offsetContainerId: 3,
+        hasTransform: false
+      }
+    ]
+  });
+  assert.equal(tree.framePolicy, 'same-origin');
+  assert.equal(tree.stitching, 'chromium-ax-tree-combiner');
+  assert.equal(tree.mayBeTruncated, true);
+  assert.equal(tree.nodeCount, 4);
+  const button = tree.nodes.find((node) => node.id === 2);
+  assert.equal(button?.parentId, 1);
+  assert.equal(button?.boundsSpace, 'offset-container');
+  assert.deepEqual(button?.resolvedBounds, { x: 15, y: 26, width: 8, height: 9 });
+  const root = tree.nodes.find((node) => node.id === 1);
+  assert.equal(root?.parentId, null);
+  assert.equal(root?.boundsSpace, 'containing-node');
+  assert.deepEqual(root?.resolvedBounds, { x: 10, y: 20, width: 100, height: 50 });
+  const shifted = tree.nodes.find((node) => node.id === 3);
+  assert.equal(shifted?.resolvedBounds, null);
+  assert.equal(shifted?.boundsSpace, 'tree-root');
+  const inside = tree.nodes.find((node) => node.id === 4);
+  assert.equal(inside?.parentId, 3);
+  assert.equal(inside?.resolvedBounds, null);
+
+  const relativeToRoot = assembleAXSnapshot({
+    rootId: 1,
+    focusId: 0,
+    url: '',
+    title: '',
+    framePolicy: 'all',
+    maxNodes: 10,
+    nodes: [
+      {
+        id: 1,
+        role: 'rootWebArea',
+        name: '',
+        childIds: [2],
+        ignored: false,
+        bounds: { x: 0, y: 0, width: 10, height: 10 },
+        offsetContainerId: 0,
+        hasTransform: false
+      },
+      {
+        id: 2,
+        role: 'genericContainer',
+        name: 'Child',
+        childIds: [],
+        ignored: false,
+        bounds: { x: 3, y: 4, width: 1, height: 1 },
+        offsetContainerId: 0,
+        hasTransform: false
+      }
+    ]
+  });
+  assert.equal(relativeToRoot.focusId, null);
+  assert.equal(relativeToRoot.mayBeTruncated, false);
+  assert.equal(relativeToRoot.nodes[1]?.boundsSpace, 'tree-root');
+  assert.deepEqual(relativeToRoot.nodes[1]?.resolvedBounds, { x: 3, y: 4, width: 1, height: 1 });
+  assert.throws(() => assembleAXSnapshot({ framePolicy: 'all', maxNodes: 1, url: '', title: '', nodes: [] }), (error: unknown) => {
+    return error instanceof AgentRuntimeError && error.code === 'snapshot-failed';
   });
 });
