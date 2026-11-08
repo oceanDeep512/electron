@@ -46,7 +46,7 @@ An `Object` frozen record of the pinned baseline and which stages are present in
 * `controlPlane` boolean - `true` when session and page control is present.
 * `nativePersona` boolean - `false`. A persona is not applied.
 * `accessibilitySnapshot` boolean - `true` when `page.snapshot()` is wired to `WebContents::RequestAXTreeSnapshot`.
-* `responseBodyObservation` boolean - `false`.
+* `responseBodyObservation` boolean - `true` when `session.observeResponses()` is wired to the URL loader tee.
 * `webSocketMessageObservation` boolean - `false`.
 
 ### `agentRuntime.AgentRuntimeError` _Readonly_
@@ -138,9 +138,35 @@ Returns [`AgentPage`](agent-runtime.md#class-agentpage)
 
 A page this API creates uses `sandbox: true`, `contextIsolation: true`, `webSecurity: true`, and turns node integration off, including workers and subframes. No preload is added. `show`, `width`, and `height` apply only to that new window.
 
+#### `session.observeResponses(options, listener)`
+
+<!--
+```YAML history
+added:
+  - pr-url: https://github.com/oceanDeep512/electron/pull/1
+    description: "Added bounded HTTP response body observation."
+```
+-->
+
+* `options` Object
+  * `urls` string[] (optional) - Full-URL prefixes, or a prefix and suffix around one `*`. An empty list observes every `http` and `https` URL. At most 32 patterns, each 1 to 2048 characters and at most one `*`.
+  * `maxBytesPerResponse` Integer (optional) - Captured prefix per response. Default is `1000000`. Must be from 1 to 10000000.
+  * `maxInFlight` Integer (optional) - Responses captured at once. Default is `8`. Must be from 1 to 64. Further responses are skipped.
+  * `maxAggregateBytes` Integer (optional) - Bytes held for in-flight captures. Default is `8000000`. Must be from 1 to 64000000.
+* `listener` Function
+  * `event` [ResponseBodyObservation](structures/response-body-observation.md)
+
+Returns `Function` - Call the returned function to remove this listener. The last listener turns observation off for the session.
+
+Observation is opt-in and session scoped. With no listeners, renderer requests stay on the direct network path. The listener receives response bytes, so a body, a URL, or a redirect target may contain secrets. This method does not redact that data and does not write it to disk or to a log.
+
+`body` is a copy of the bytes on the network data pipe. For an ordinary page or `fetch` request those are the bytes `URLRequest::Read` produced after Chromium's content-encoding filter. `networkDecoded` is false when the request asked for client-side content decoding; the bytes are still copied unchanged. A `redirect` event has `body: null` and does not stand in for the final response. A `skipped` event means this response was not captured. The page's request still completes.
+
+Hitting a capture limit does not fail or stall the request. `truncated: true` means only a prefix was delivered to the listener. `skipReason` tells why a response was not captured.
+
 #### `session.close()`
 
-Closes every page handle. Owned windows are destroyed. Adopted `WebContents` are not destroyed. The in-memory session record is dropped.
+Closes every page handle, removes response listeners, and stops new captures. Owned windows are destroyed. Adopted `WebContents` are not destroyed. The in-memory session record is dropped. A capture already in flight keeps forwarding bytes to the page and does not deliver them after the listener is gone.
 
 ## Class: AgentPage
 

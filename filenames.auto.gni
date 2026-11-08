@@ -163,6 +163,7 @@ auto_filenames = {
     "docs/api/structures/render-process-gone-details.md",
     "docs/api/structures/resolved-endpoint.md",
     "docs/api/structures/resolved-host.md",
+    "docs/api/structures/response-body-observation.md",
     "docs/api/structures/scrubber-item.md",
     "docs/api/structures/segmented-control-segment.md",
     "docs/api/structures/serial-port.md",

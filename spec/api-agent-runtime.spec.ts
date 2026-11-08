@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import * as http from 'node:http';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import * as zlib from 'node:zlib';
 
 import { closeAllWindows } from './lib/window-helpers.ts';
 
@@ -100,11 +101,11 @@ afterEach(async () => {
 });
 
 describe('agentRuntime checkpoint', () => {
-  it('exposes the control plane and does not export native observation', () => {
+  it('exposes the control plane and leaves websocket and persona off', () => {
     expect(agentRuntime.checkpoint.controlPlane).toBe(true);
     expect(agentRuntime.checkpoint.nativePersona).toBe(false);
     expect(agentRuntime.checkpoint.accessibilitySnapshot).toBe(true);
-    expect(agentRuntime.checkpoint.responseBodyObservation).toBe(false);
+    expect(agentRuntime.checkpoint.responseBodyObservation).toBe(true);
     expect(agentRuntime.checkpoint.webSocketMessageObservation).toBe(false);
     expect(agentRuntime.checkpoint.baseline).toBe('ef2710fa6c10fe56365a9949fa783d26ca1499e5');
     expect('snapshot' in agentRuntime).toBe(false);
@@ -403,6 +404,292 @@ describe('agentRuntime accessibility snapshot', () => {
     } finally {
       await main.close();
       await foreign.close();
+    }
+  });
+});
+
+function bytesOf(body: Uint8Array | null): number[] {
+  return body ? Array.from(body) : [];
+}
+
+async function waitFor<T>(read: () => T | undefined): Promise<T> {
+  const started = Date.now();
+  while (Date.now() - started < 5000) {
+    const value = read();
+    if (value !== undefined) return value;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error('timed out waiting for a response observation');
+}
+
+describe('agentRuntime response bodies', () => {
+  it('rejects an invalid capture limit before any request', () => {
+    const runtimeSession = createSession();
+    expect(() => runtimeSession.observeResponses({ maxBytesPerResponse: 0 }, () => {})).toThrow();
+    try {
+      runtimeSession.observeResponses({ urls: ['one*two*'] }, () => {});
+      expect.fail('a pattern with two stars should be rejected');
+    } catch (error) {
+      expect(errorCode(error)).toBe('invalid-response-observation');
+    }
+  });
+
+  it('reads text, empty, binary, and chunked bodies without a webRequest listener', async () => {
+    const binary = Buffer.from([0, 255, 128, 65]);
+    const server = await listen((req, res) => {
+      if (req.url === '/empty') {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      if (req.url === '/bin') {
+        res.writeHead(201, { 'content-type': 'application/octet-stream' });
+        res.end(binary);
+        return;
+      }
+      if (req.url === '/chunks') {
+        res.writeHead(200, { 'content-type': 'text/plain' });
+        res.write('aa');
+        setTimeout(() => {
+          res.write('bb');
+          res.end();
+        }, 20);
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('hello');
+    });
+    const runtimeSession = createSession();
+    const events: Array<{ phase: string; url: string; body: Uint8Array | null; requestId: string }> = [];
+    runtimeSession.observeResponses({ urls: [`${server.origin}/`] }, (event) => {
+      events.push(event);
+    });
+    const page = runtimeSession.createPage();
+    try {
+      expect(await page.webContents.executeJavaScript(`fetch(${JSON.stringify(`${server.origin}/text`)}).then((response) => response.text())`)).toBe('hello');
+      const text = await waitFor(() => events.find((event) => event.phase === 'completed' && event.url.endsWith('/text')));
+      expect(Buffer.from(bytesOf(text.body)).toString('utf8')).toBe('hello');
+
+      expect(await page.webContents.executeJavaScript(`fetch(${JSON.stringify(`${server.origin}/empty`)}).then((response) => response.status)`)).toBe(204);
+      const empty = await waitFor(() => events.find((event) => event.phase === 'completed' && event.url.endsWith('/empty')));
+      expect(bytesOf(empty.body)).toEqual([]);
+
+      const fromPage = await page.webContents.executeJavaScript(`fetch(${JSON.stringify(`${server.origin}/bin`)}).then(async (response) => Array.from(new Uint8Array(await response.arrayBuffer())))`);
+      expect(fromPage).toEqual([0, 255, 128, 65]);
+      const bin = await waitFor(() => events.find((event) => event.phase === 'completed' && event.url.endsWith('/bin')));
+      expect(bytesOf(bin.body)).toEqual([0, 255, 128, 65]);
+
+      expect(await page.webContents.executeJavaScript(`fetch(${JSON.stringify(`${server.origin}/chunks`)}).then((response) => response.text())`)).toBe('aabb');
+      const chunks = await waitFor(() => events.find((event) => event.phase === 'completed' && event.url.endsWith('/chunks')));
+      expect(Buffer.from(bytesOf(chunks.body)).toString('utf8')).toBe('aabb');
+      expect(page.webContents.debugger.isAttached()).toBe(false);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('observes decoded gzip and brotli bodies for an ordinary fetch', async () => {
+    const server = await listen((req, res) => {
+      if (req.url === '/gzip') {
+        res.writeHead(200, { 'content-type': 'text/plain', 'content-encoding': 'gzip' });
+        res.end(zlib.gzipSync(Buffer.from('gzip-body')));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/plain', 'content-encoding': 'br' });
+      res.end(zlib.brotliCompressSync(Buffer.from('br-body')));
+    });
+    const runtimeSession = createSession();
+    const events: Array<{ phase: string; url: string; body: Uint8Array | null; networkDecoded: boolean }> = [];
+    runtimeSession.observeResponses({}, (event) => events.push(event));
+    const page = runtimeSession.createPage();
+    try {
+      expect(await page.webContents.executeJavaScript(`fetch(${JSON.stringify(`${server.origin}/gzip`)}).then((response) => response.text())`)).toBe('gzip-body');
+      const gzip = await waitFor(() => events.find((event) => event.phase === 'completed' && event.url.endsWith('/gzip')));
+      expect(gzip.networkDecoded).toBe(true);
+      expect(Buffer.from(bytesOf(gzip.body)).toString('utf8')).toBe('gzip-body');
+      expect(await page.webContents.executeJavaScript(`fetch(${JSON.stringify(`${server.origin}/br`)}).then((response) => response.text())`)).toBe('br-body');
+      const brotli = await waitFor(() => events.find((event) => event.phase === 'completed' && event.url.endsWith('/br')));
+      expect(brotli.networkDecoded).toBe(true);
+      expect(Buffer.from(bytesOf(brotli.body)).toString('utf8')).toBe('br-body');
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('correlates a redirect without inventing its body', async () => {
+    const server = await listen((req, res) => {
+      if (req.url === '/start') {
+        res.writeHead(302, { location: '/final' });
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('landed');
+    });
+    const runtimeSession = createSession();
+    const events: Array<{ phase: string; requestId: string; url: string; body: Uint8Array | null; status: number }> = [];
+    runtimeSession.observeResponses({}, (event) => events.push(event));
+    const page = runtimeSession.createPage();
+    try {
+      expect(await page.webContents.executeJavaScript(`fetch(${JSON.stringify(`${server.origin}/start`)}, { redirect: 'follow' }).then((response) => response.text())`)).toBe('landed');
+      const redirect = await waitFor(() => events.find((event) => event.phase === 'redirect'));
+      expect(redirect.body).toBe(null);
+      expect(redirect.status).toBe(302);
+      const completed = await waitFor(() => events.find((event) => event.phase === 'completed' && event.requestId === redirect.requestId));
+      expect(Buffer.from(bytesOf(completed.body)).toString('utf8')).toBe('landed');
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('keeps the page body when the capture is truncated, skipped, or the listener is slow', async () => {
+    let pending: Array<http.ServerResponse> = [];
+    let opened: (() => void) | undefined;
+    const bothStarted = new Promise<void>((resolve) => {
+      opened = resolve;
+    });
+    const held = await listen((_req, res) => {
+      pending.push(res);
+      if (pending.length === 2) opened?.();
+    });
+    const slow = await listen((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/octet-stream' });
+      res.write(Buffer.alloc(12, 7));
+      setTimeout(() => res.end(Buffer.alloc(8, 7)), 30);
+    });
+    const runtimeSession = createSession();
+    const events: Array<{ phase: string; url: string; body: Uint8Array | null; truncated: boolean; skipReason: string }> = [];
+    runtimeSession.observeResponses({ maxBytesPerResponse: 4, maxInFlight: 1, maxAggregateBytes: 4 }, (event) => {
+      events.push(event);
+    });
+    const page = runtimeSession.createPage();
+    try {
+      const reads = page.webContents.executeJavaScript(`
+        Promise.all([
+          fetch(${JSON.stringify(`${held.origin}/a`)}).then((response) => response.text()),
+          fetch(${JSON.stringify(`${held.origin}/b`)}).then((response) => response.text())
+        ])
+      `);
+      await bothStarted;
+      for (const response of pending) {
+        response.writeHead(200, { 'content-type': 'text/plain' });
+        response.end('abcdefghij');
+      }
+      expect(await reads).toEqual(['abcdefghij', 'abcdefghij']);
+      const completed = await waitFor(() => events.find((event) => event.phase === 'completed'));
+      expect(completed.truncated).toBe(true);
+      expect(bytesOf(completed.body)).toEqual([97, 98, 99, 100]);
+      const skipped = await waitFor(() => events.find((event) => event.phase === 'skipped'));
+      expect(skipped.skipReason === 'in-flight-limit' || skipped.skipReason === 'aggregate-limit').toBe(true);
+      expect(skipped.body).toBe(null);
+
+      const total = await page.webContents.executeJavaScript(`
+        fetch(${JSON.stringify(`${slow.origin}/slow`)}).then(async (response) => {
+          const reader = response.body.getReader();
+          let count = 0;
+          while (true) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            const step = await reader.read();
+            if (step.done) break;
+            count += step.value.byteLength;
+          }
+          return count;
+        })
+      `);
+      expect(total).toBe(20);
+    } finally {
+      await held.close();
+      await slow.close();
+    }
+  });
+
+  it('reports a failed request and a canceled fetch without keeping the page waiting', async () => {
+    const server = await listen((req, res) => {
+      if (req.url === '/reset') {
+        req.socket.destroy();
+        return;
+      }
+      setTimeout(() => {
+        res.writeHead(200, { 'content-type': 'text/plain' });
+        res.end('late');
+      }, 300);
+    });
+    const runtimeSession = createSession();
+    const events: Array<{ phase: string; url: string; body: Uint8Array | null }> = [];
+    runtimeSession.observeResponses({}, (event) => events.push(event));
+    const page = runtimeSession.createPage();
+    try {
+      const reset = await page.webContents.executeJavaScript(
+        `fetch(${JSON.stringify(`${server.origin}/reset`)}).then(() => 'ok', () => 'failed')`
+      );
+      expect(reset).toBe('failed');
+      const aborted = await waitFor(() => events.find((event) => event.url.endsWith('/reset') && (event.phase === 'aborted' || event.phase === 'completed')));
+      expect(aborted.phase === 'aborted' || bytesOf(aborted.body).length === 0).toBe(true);
+      const canceled = await page.webContents.executeJavaScript(`
+        const controller = new AbortController();
+        const pending = fetch(${JSON.stringify(`${server.origin}/hang`)}, { signal: controller.signal }).then(() => 'ok', () => 'aborted');
+        controller.abort();
+        pending
+      `);
+      expect(canceled).toBe('aborted');
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('isolates sessions and leaves the request alone when nothing is subscribed', async () => {
+    const server = await listen((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('plain');
+    });
+    const watched = createSession();
+    const other = createSession();
+    const events: string[] = [];
+    watched.observeResponses({}, (event) => {
+      if (event.phase === 'completed') events.push(event.url);
+    });
+    const watchedPage = watched.createPage();
+    const otherPage = other.createPage();
+    const quiet = createSession().createPage();
+    try {
+      expect(await quiet.webContents.executeJavaScript(`fetch(${JSON.stringify(`${server.origin}/quiet`)}).then((response) => response.text())`)).toBe('plain');
+      expect(await otherPage.webContents.executeJavaScript(`fetch(${JSON.stringify(`${server.origin}/other`)}).then((response) => response.text())`)).toBe('plain');
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(events.some((url) => url.endsWith('/other') || url.endsWith('/quiet'))).toBe(false);
+      expect(await watchedPage.webContents.executeJavaScript(`fetch(${JSON.stringify(`${server.origin}/watched`)}).then((response) => response.text())`)).toBe('plain');
+      await waitFor(() => events.find((url) => url.endsWith('/watched')));
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('still observes when a webRequest listener is installed, and stops after unsubscribe', async () => {
+    const server = await listen((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('with-listener');
+    });
+    const runtimeSession = createSession();
+    let webRequestHits = 0;
+    runtimeSession.session.webRequest.onCompleted({ urls: [`${server.origin}/*`] }, () => {
+      webRequestHits += 1;
+    });
+    const events: Array<{ phase: string; body: Uint8Array | null }> = [];
+    const stop = runtimeSession.observeResponses({}, (event) => events.push(event));
+    const page = runtimeSession.createPage();
+    try {
+      expect(await page.webContents.executeJavaScript(`fetch(${JSON.stringify(`${server.origin}/once`)}).then((response) => response.text())`)).toBe('with-listener');
+      const completed = await waitFor(() => events.find((event) => event.phase === 'completed'));
+      expect(Buffer.from(bytesOf(completed.body)).toString('utf8')).toBe('with-listener');
+      expect(webRequestHits).toBeGreaterThan(0);
+      stop();
+      events.splice(0, events.length);
+      expect(await page.webContents.executeJavaScript(`fetch(${JSON.stringify(`${server.origin}/after`)}).then((response) => response.text())`)).toBe('with-listener');
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(events).toEqual([]);
+      runtimeSession.close();
+      expect(() => runtimeSession.observeResponses({}, () => {})).toThrow();
+    } finally {
+      await server.close();
     }
   });
 });

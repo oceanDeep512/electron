@@ -37,10 +37,22 @@ import {
   resolvePartition,
   safeUrlForError,
   settleEffectGate,
+  applyResponseObservation,
+  createResponseObservationBudget,
+  normalizeResponseObservation,
+  responseUrlMatches,
   shouldArmNavigation,
+  unionResponseObservationPolicies,
   validatePersona,
+  RESPONSE_DEFAULT_AGGREGATE_BYTES,
+  RESPONSE_DEFAULT_MAX_BYTES,
+  RESPONSE_DEFAULT_MAX_IN_FLIGHT,
+  RESPONSE_MAX_AGGREGATE_BYTES,
+  RESPONSE_MAX_BYTES,
+  RESPONSE_MAX_IN_FLIGHT,
   type NavigationEvent,
-  type Persona
+  type Persona,
+  type ResponseObservationEvent
 } from '../lib/browser/api/agent-runtime-logic.ts';
 
 function runPageScript(code: string, names: string[], values: unknown[]): unknown {
@@ -84,13 +96,13 @@ function validPersona(extra: Record<string, unknown> = {}): Record<string, unkno
   };
 }
 
-test('checkpoint records the pinned baseline and leaves native stages off', () => {
+test('checkpoint records the pinned baseline and leaves websocket and persona off', () => {
   assert.equal(checkpoint.baseline, 'ef2710fa6c10fe56365a9949fa783d26ca1499e5');
   assert.equal(checkpoint.chromium, '159.0.8140.0');
   assert.equal(checkpoint.controlPlane, true);
   assert.equal(checkpoint.nativePersona, false);
   assert.equal(checkpoint.accessibilitySnapshot, true);
-  assert.equal(checkpoint.responseBodyObservation, false);
+  assert.equal(checkpoint.responseBodyObservation, true);
   assert.equal(checkpoint.webSocketMessageObservation, false);
   assert.equal(checkpoint.isolatedWorldId, 1001);
   assert.notEqual(checkpoint.isolatedWorldId, 0);
@@ -608,4 +620,93 @@ test('accessibility assembly keeps relationships and refuses transformed bounds'
   assert.throws(() => assembleAXSnapshot({ framePolicy: 'all', maxNodes: 1, url: '', title: '', nodes: [] }), (error: unknown) => {
     return error instanceof AgentRuntimeError && error.code === 'snapshot-failed';
   });
+});
+
+function responseEvent(extra: Partial<ResponseObservationEvent> = {}): ResponseObservationEvent {
+  return {
+    requestId: '7',
+    phase: 'completed',
+    url: 'https://example.test/item',
+    redirectUrl: '',
+    status: 200,
+    mimeType: 'application/octet-stream',
+    networkDecoded: true,
+    truncated: false,
+    skipReason: '',
+    errorCode: 0,
+    body: new Uint8Array([0, 255, 128, 65, 66]),
+    ...extra
+  };
+}
+
+test('response observation limits match the native constants and reject bad options', () => {
+  assert.equal(RESPONSE_DEFAULT_MAX_BYTES, 1_000_000);
+  assert.equal(RESPONSE_MAX_BYTES, 10_000_000);
+  assert.equal(RESPONSE_DEFAULT_MAX_IN_FLIGHT, 8);
+  assert.equal(RESPONSE_MAX_IN_FLIGHT, 64);
+  assert.equal(RESPONSE_DEFAULT_AGGREGATE_BYTES, 8_000_000);
+  assert.equal(RESPONSE_MAX_AGGREGATE_BYTES, 64_000_000);
+  const policy = normalizeResponseObservation(undefined);
+  assert.equal(policy.maxBytesPerResponse, RESPONSE_DEFAULT_MAX_BYTES);
+  assert.deepEqual(policy.urls, []);
+  assert.throws(() => normalizeResponseObservation({ maxBytesPerResponse: 0 }), (error: unknown) => {
+    return error instanceof AgentRuntimeError && error.code === 'invalid-response-observation';
+  });
+  assert.throws(() => normalizeResponseObservation({ urls: ['http://ok/*', 'bad*pattern*'] }), (error: unknown) => {
+    return error instanceof AgentRuntimeError && error.code === 'invalid-response-observation';
+  });
+  assert.equal(responseUrlMatches([], 'https://example.test/a'), true);
+  assert.equal(responseUrlMatches([], 'file:///tmp/a'), false);
+  assert.equal(responseUrlMatches(['https://example.test/'], 'https://example.test/a'), true);
+  assert.equal(responseUrlMatches(['https://example.test/*/tail'], 'https://example.test/a/tail'), true);
+  assert.equal(responseUrlMatches(['https://example.test/'], 'https://other.test/'), false);
+});
+
+test('response delivery keeps exact bytes, skips overflow, and invents no redirect body', () => {
+  const policy = normalizeResponseObservation({
+    urls: ['https://example.test/'],
+    maxBytesPerResponse: 4,
+    maxInFlight: 1,
+    maxAggregateBytes: 4
+  });
+  const budget = createResponseObservationBudget();
+  const opened = applyResponseObservation(policy, budget, responseEvent({ phase: 'opened', body: null }));
+  assert.equal(opened?.phase, 'opened');
+  assert.equal(opened?.body, null);
+  assert.equal(budget.inFlight, 1);
+  const blocked = applyResponseObservation(policy, budget, responseEvent({
+    phase: 'opened',
+    requestId: '8',
+    body: null
+  }));
+  assert.equal(blocked?.phase, 'skipped');
+  assert.equal(blocked?.skipReason, 'in-flight-limit');
+  assert.equal(blocked?.body, null);
+  const redirect = applyResponseObservation(policy, budget, responseEvent({
+    phase: 'redirect',
+    redirectUrl: 'https://example.test/next',
+    status: 302,
+    body: new Uint8Array([1, 2, 3, 4])
+  }));
+  assert.equal(redirect?.body, null);
+  assert.equal(redirect?.status, 302);
+  const completed = applyResponseObservation(policy, budget, responseEvent());
+  assert.equal(completed?.truncated, true);
+  assert.deepEqual(Array.from(completed?.body ?? []), [0, 255, 128, 65]);
+  assert.equal(budget.inFlight, 0);
+  const other = applyResponseObservation(policy, budget, responseEvent({
+    phase: 'completed',
+    requestId: '9',
+    url: 'https://other.test/'
+  }));
+  assert.equal(other, null);
+  const union = unionResponseObservationPolicies([
+    policy,
+    normalizeResponseObservation({ urls: ['https://other.test/'], maxBytesPerResponse: 8, maxInFlight: 2, maxAggregateBytes: 9 })
+  ]);
+  assert.deepEqual(union.urls, ['https://example.test/', 'https://other.test/']);
+  assert.equal(union.maxBytesPerResponse, 8);
+  assert.equal(union.maxInFlight, 2);
+  const caughtAll = unionResponseObservationPolicies([policy, normalizeResponseObservation({})]);
+  assert.deepEqual(caughtAll.urls, []);
 });

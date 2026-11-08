@@ -1,6 +1,6 @@
 # Agent Runtime
 
-This page records the second checkpoint of the agent runtime. The main-process control plane is repaired, and `page.snapshot()` reads Chromium's accessibility tree. Native fingerprint persona, HTTP response bodies, and WebSocket message bodies are still not implemented.
+This page records the third checkpoint of the agent runtime. The control plane and accessibility snapshots remain, and HTTP response bodies can be observed from the session. Native fingerprint persona and WebSocket message bodies are still not implemented. The C++ for snapshots and response bodies is source only: it has not been compiled or run.
 
 ## Status of this checkpoint
 
@@ -12,11 +12,11 @@ This page records the second checkpoint of the agent runtime. The main-process c
 | Navigation, locator, and input without CDP | Implemented, with the boundaries below |
 | Persona config validation | Implemented as a pure check |
 | Applying a fingerprint persona | Not implemented. `createSession` rejects a persona |
-| Accessibility snapshot | Wired to `WebContents::RequestAXTreeSnapshot` |
-| HTTP response body observation | Not implemented |
+| Accessibility snapshot | Wired to `WebContents::RequestAXTreeSnapshot`. Source only, not compiled |
+| HTTP response body observation | Wired through `session.observeResponses()`. Source only, not compiled |
 | WebSocket message body observation | Not implemented |
 
-`electron.agentRuntime.checkpoint` exposes the same flags at runtime. `accessibilitySnapshot` is true. `nativePersona`, `responseBodyObservation`, and `webSocketMessageObservation` are false.
+`electron.agentRuntime.checkpoint` exposes the same flags at runtime. `accessibilitySnapshot` and `responseBodyObservation` are true. `nativePersona` and `webSocketMessageObservation` are false.
 
 ## Pinned baseline
 
@@ -103,45 +103,67 @@ The click point is the CSS box center multiplied by `webContents.zoomFactor`, th
 
 `mayBeTruncated` is true only when the node count reached `maxNodes`. Chromium can also return a shorter tree when its own timeout fires, and that case is not separately flagged.
 
+## HTTP response bodies
+
+`session.observeResponses()` validates the filter and limits, then installs one native listener on that session's `Session`. Extra JavaScript listeners share that listener. The native side is `session.setResponseBodyObservation()`. With no listener, `InterceptState::response_body_enabled()` is false and both the URL loader gate and `ProxyingURLLoaderFactory` keep the existing direct pipe.
+
+A matching `http` or `https` request is claimed once. The gate's direct branch and the proxy's direct branch insert `ResponseBodyURLLoader` only after that claim. `kObserve` tees inside `ObservedURLLoader`. `kProxy` tees when `InProgressRequest` forwards `current_body_` to the renderer. A request is not teed in two of those places. Redirects forward `OnReceiveRedirect` and emit `phase: "redirect"` with no body.
+
+The tee reads the network consumer only when the renderer producer accepts bytes. One 16 KiB pending chunk is the only userspace forwarding buffer. Capture stops at `maxBytesPerResponse` and at the aggregate cap, sets `truncated` or `skipReason`, and keeps forwarding. Creating the pipe, filling the in-flight set, or filling the aggregate does not fail the request. Unsubscribe and session close bump the generation, drop the capture buffer, and leave the forward running.
+
+Chromium 159 `services/network/url_loader.cc` fills the data pipe from `URLRequest::Read`. `URLResponseHead.client_side_content_decoding_types` is non-empty only when the request set client-side content decoding. Ordinary page and `fetch` loads do not, so the observed bytes are the filtered body, including gzip, deflate, and brotli decoded by the network stack. `networkDecoded` reports that field. The tee does not decode or re-encode.
+
+Not observed, and not claimed:
+
+*   `file:`, custom protocols, and WebSocket. WebSocket stays the next checkpoint. `ProxyingWebSocket` still drops the connection endpoints after connect.
+*   The extensions early return in `ElectronBrowserClient::WillCreateURLLoaderFactory` when the extensions WebRequest API proxies the factory, Electron has no webRequest listener, and there is no protocol intercept handler. That path returns before Electron's gate and proxy.
+*   CORS preflight `InProgressRequest` objects.
+
+The listener is intentionally given the body. Nothing in this path writes the body, cookies, or authorization headers to a log or to disk.
+
 ## Explicitly not implemented
 
-The following stay out of this checkpoint. They are the next stages, not hidden behavior of the current API.
+The following stay out of this checkpoint.
 
 *   Native persona application, including user agent and Client Hints, locale, timezone, hardware concurrency, device memory, screen, WebGL, WebGPU identity, canvas, audio, fonts, and WebRTC IP policy.
-*   Passive HTTP response body capture. The body must be tee'd from the URL loader data pipe on both the direct path and the proxy path, without adding observer backpressure or dropping the pipe before completion.
-*   WebSocket message body capture. Frame metadata and payload bytes are separate, and the current proxy drops the connection endpoints after connect.
+*   WebSocket message body capture.
 *   Any claim that a persona is undetectable, or that codecs and Widevine are something other than what this build actually contains.
+*   A compiled or runtime-executed proof of the accessibility snapshot or the response-body tee. Both are source implementations.
 
 `build/args/all.gn` already sets proprietary codecs, Chrome ffmpeg branding, and Widevine flags. Those flags are unchanged here. A CDM is present only when its file exists. This checkpoint does not pretend otherwise.
 
 ## Verification gates
 
-Pure logic is covered by `script/agent-runtime-logic.test.mts`. It imports the production module and can run without an Electron binary:
+Pure logic is covered by `spec/agent-runtime-logic.test.ts`. It imports the production module, including response-limit validation and delivery, and can run without an Electron binary:
 
 ```bash
-node --experimental-strip-types --test script/agent-runtime-logic.test.mts
+node --experimental-strip-types --test spec/agent-runtime-logic.test.ts
+node node_modules/typescript/bin/tsc -p tsconfig.agent-runtime-logic.json --pretty false --noEmit
 ```
 
-`spec/api-agent-runtime.spec.ts` and `spec/fixtures/agent-runtime/` exercise the registered API inside Electron: partition isolation, adoption, HTTP 201 and 404, non-HTTP status, cancellation, input, and accessibility snapshots with a same-origin iframe and a cross-origin iframe. Those specs were not executed in this checkpoint. They must not be described as passed until `e test` runs them. The C++ binding was not compiled.
+The second command typechecks that test together with `lib/browser/api/agent-runtime-logic.ts`. It does not use `verbatimModuleSyntax`, and it is not part of `tsconfig.script.json`. Putting the test under `script/` made `tsc -p tsconfig.script.json` parse the CommonJS logic module with `verbatimModuleSyntax`. The test now lives under `spec/`.
+
+`spec/api-agent-runtime.spec.ts` and `spec/fixtures/agent-runtime/` exercise the registered API inside Electron: partition isolation, adoption, HTTP 201 and 404, non-HTTP status, cancellation, input, accessibility snapshots, and response bodies with and without a webRequest listener. Those specs were not executed in this checkpoint. They must not be described as passed until `e test` runs them. The C++ bindings were not compiled. A focused native test binary is also pending for the same reason.
 
 Not run for this checkpoint, and not claimed:
 
-*   `e sync`, `gclient`, or a Chromium checkout beyond the pinned public headers that were read for `RequestAXTreeSnapshot`
+*   `e sync`, `gclient`, or a Chromium checkout beyond the pinned public sources read for `RequestAXTreeSnapshot` and `services/network/url_loader.cc`
 *   `e build` or any full Electron build
 *   `e test` or vitest under Electron
+*   `script/gen-filenames.mts`. Running it here would drop `node_header_sources`, because `../third_party/electron_node` and `../v8` are not checked out. The new structure doc was inserted into `filenames.auto.gni` in sorted order by hand. The new C++ files are listed in `filenames.gni`.
 
-`filenames.auto.gni` is still produced by `script/gen-filenames.mts`. Running that generator here would drop `node_header_sources`, because `../third_party/electron_node` and `../v8` are not checked out. The browser bundle graph and the `lib/` typecheck list were compared with the generator's own rules instead. `docs/api/agent-runtime.md` is listed with the other API docs.
-
-`docs/api-history.schema.json` accepts `https://github.com/oceanDeep512/electron/pull/1` in addition to `electron/electron` pull requests. The history blocks use that fork pull request. No `electron/electron` pull request number was invented. `lint-roller-markdown-api-history` reads that schema and reported 0 errors. A warning in `crash-reporter.md` is pre-existing.
+`docs/api-history.schema.json` accepts `https://github.com/oceanDeep512/electron/pull/1` in addition to `electron/electron` pull requests. The history blocks use that fork pull request. No `electron/electron` pull request number was invented.
 
 This checkpoint ran:
 
-*   `node --experimental-strip-types --test script/agent-runtime-logic.test.mts` — 18 passed, 0 failed. This executes the production logic module. It is not an Electron runtime test.
-*   `node --experimental-strip-types --check` on the logic module, the runtime module, the logic test, and the spec. That is syntax only, not a typecheck.
-*   `node script/create-api-json.mjs` and `electron-typescript-definitions --api=electron-api.json`. `agentRuntime` and `captureAccessibilitySnapshot` are in the generated JSON and `electron.d.ts`. Those generated files are gitignored.
-*   `node spec/ts-smoke/runner.js` — exit 0. That typechecks `electron.d.ts`.
-*   `tsc -p tsconfig.electron.json` reports no errors in the agent runtime files. The same command exits 1 because `@node/...` imports need `../third_party/electron_node`, which is not checked out.
-*   `tsc -p tsconfig.spec.json` reports no errors in `spec/api-agent-runtime.spec.ts` when `vitest` is stubbed. The real `vitest` package was not installed: `npm install vitest@5` crashed in npm's arborist (`edgesOut`).
-*   `node ./build/bundle/bundle.mjs --target <target> --print-graph` for every bundle target matches `filenames.auto.gni`. `lib_typecheck_sources` matches the generator's `lib/` walk. `script/gen-filenames.mts` itself was not run, because it would also rewrite `node_header_sources` from the missing Node and V8 trees.
+*   `node --experimental-strip-types --test spec/agent-runtime-logic.test.ts` — exit 0, 20 passed, 0 failed. This executes the production logic module, including response validation and delivery. It is not an Electron runtime test. Node prints `MODULE_TYPELESS_PACKAGE_JSON` because the logic file is TypeScript inside a package with no `"type"` field. That warning is left in place.
+*   `node node_modules/typescript/bin/tsc -p tsconfig.agent-runtime-logic.json --pretty false --noEmit` — exit 0. This project includes only the logic test and `lib/browser/api/agent-runtime-logic.ts`. It sets `types: ["node"]` so TypeScript 7 loads the real `@types/node`. It does not set `verbatimModuleSyntax`.
+*   `node node_modules/typescript/bin/tsc -p tsconfig.script.json --pretty false --noEmit` — exit 1. The output contains no `agent-runtime` path and no `TS1287`. The remaining errors are pre-existing `script/` files that need `@types/node` and packages such as `@electron/get` and `@octokit/rest`, which this environment does not install into the script project.
+*   `node --experimental-strip-types --check` on the logic module, the runtime module, and the spec — exit 0. That is syntax only.
+*   `node script/create-api-json.mjs` and `node node_modules/@electron/typescript-definitions/dist/bin.js --api=electron-api.json` — exit 0. `observeResponses`, `setResponseBodyObservation`, and `ResponseBodyObservation` are in the generated JSON and `electron.d.ts`. Those generated files are gitignored.
+*   `node spec/ts-smoke/runner.js` — exit 0. The fixture imports `agentRuntime`, calls `createSession`, `observeResponses`, `setResponseBodyObservation`, `captureAccessibilitySnapshot`, and `snapshot`, and keeps `@ts-expect-error` on a string byte limit, a missing listener, and a missing partition.
+*   `node node_modules/typescript/bin/tsc -p tsconfig.electron.json --pretty false --noEmit` — exit 1, ten errors, all missing `@node/...` because `../third_party/electron_node` is not checked out. No error names an agent runtime file.
+*   `node node_modules/typescript/bin/tsc -p tsconfig.spec.json --pretty false --noEmit` — exit 1. No error names an agent runtime file. The errors are missing spec dependencies (`protobufjs`, `busboy`, `ws`, `send`, and others) that a full install would provide. The typecheck used real `vitest@5.1.0` and real `@types/node@22.19.1`. A temporary vitest declaration stub from the previous checkpoint was deleted and is not a result of this run.
+*   `node node_modules/@electron/lint-roller/dist/bin/lint-markdown-api-history.js` with the repo's history arguments — exit 0, 131 blocks, 0 errors. One pre-existing warning in `crash-reporter.md`.
 
-oxlint is not installed in this environment. `e build` and `e test` were not run. The C++ snapshot binding is therefore uncompiled, and the Electron specs are unexecuted.
+oxlint is not installed in this environment. `e build` and `e test` were not run. The C++ response-body tee and the accessibility snapshot binding are source only. `spec/api-agent-runtime.spec.ts` was not executed.

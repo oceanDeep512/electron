@@ -7,6 +7,9 @@
 
 #include <stdint.h>
 
+#include <atomic>
+#include <cstddef>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -44,6 +47,55 @@ extensions::WebRequestResourceType ResourceTypeOf(
 
 constexpr uint32_t kAllResourceTypes = ~0u;
 
+// Kept in sync with lib/browser/api/agent-runtime-logic.ts.
+inline constexpr size_t kResponseBodyDefaultMaxBytes = 1000000;
+inline constexpr size_t kResponseBodyMaxBytes = 10000000;
+inline constexpr int kResponseBodyDefaultMaxInFlight = 8;
+inline constexpr int kResponseBodyMaxInFlight = 64;
+inline constexpr size_t kResponseBodyDefaultAggregateBytes = 8000000;
+inline constexpr size_t kResponseBodyMaxAggregateBytes = 64000000;
+
+// Limits for one session's response-body observation. Patterns are matched
+// against the full URL. An empty pattern list matches every http(s) URL.
+struct ResponseBodyLimits {
+  std::vector<std::string> patterns;
+  size_t max_bytes_per_response = kResponseBodyDefaultMaxBytes;
+  int max_in_flight = kResponseBodyDefaultMaxInFlight;
+  size_t max_aggregate_bytes = kResponseBodyDefaultAggregateBytes;
+};
+
+// One observation event. `has_body` is false for opened, redirect, and skipped
+// events; those must not carry invented response bytes.
+struct ResponseBodyEvent {
+  std::string phase;
+  std::string request_id;
+  uint64_t generation = 0;
+  std::string url;
+  std::string redirect_url;
+  int status = 0;
+  std::string mime_type;
+  bool network_decoded = true;
+  bool truncated = false;
+  std::string skip_reason;
+  int error_code = 0;
+  bool has_body = false;
+  size_t buffered = 0;
+  std::vector<uint8_t> body;
+};
+
+enum class ResponseBodyClaimKind { kIgnore, kSkip, kClaim };
+
+struct ResponseBodyTicket {
+  ResponseBodyClaimKind kind = ResponseBodyClaimKind::kIgnore;
+  std::string request_id;
+  uint64_t generation = 0;
+  size_t max_bytes = 0;
+  std::string url;
+  std::string skip_reason;
+};
+
+class ResponseBodyListener;
+
 // What makes a session's requests leave the direct renderer -> network path:
 // a webRequest listener that can block or modify them (routed through
 // ProxyingURLLoaderFactory on the UI thread), one that only observes them
@@ -62,9 +114,31 @@ class InterceptState : public base::RefCountedThreadSafe<InterceptState> {
 
   Route RouteFor(const network::ResourceRequest& request) const;
 
+  // Fast path for the URL loader gate. False means no response-body subscriber.
+  bool response_body_enabled() const {
+    return response_body_enabled_.load(std::memory_order_acquire);
+  }
+
+  // UI thread. Replacing the listener does not bump the generation, so a tee
+  // that already started can still deliver. Clearing does.
+  void InstallResponseBodyListener(std::unique_ptr<ResponseBodyListener> listener,
+                                   ResponseBodyLimits limits);
+  void ClearResponseBodyObservation();
+
+  // Any thread. kIgnore emits nothing. kSkip emits a skipped event and does
+  // not reserve a slot. kClaim reserves one in-flight slot.
+  ResponseBodyTicket ClaimResponseBody(const GURL& url);
+  void FinishResponseBodyClaim();
+  size_t AcceptResponseBodyBytes(size_t want, size_t local_room);
+  void ReleaseResponseBodyBytes(size_t bytes);
+  bool ResponseBodyGenerationCurrent(uint64_t generation) const;
+  void EmitResponseBody(ResponseBodyEvent event);
+
  private:
   friend class base::RefCountedThreadSafe<InterceptState>;
   ~InterceptState();
+
+  void DeliverResponseBody(ResponseBodyEvent event);
 
   bool WantsURL(const GURL& url) const EXCLUSIVE_LOCKS_REQUIRED(lock_);
 
@@ -73,12 +147,25 @@ class InterceptState : public base::RefCountedThreadSafe<InterceptState> {
   uint32_t observer_types_ GUARDED_BY(lock_) = 0;
   base::flat_set<std::string> intercepted_schemes_ GUARDED_BY(lock_);
   std::vector<std::string> ignore_connections_limit_domains_ GUARDED_BY(lock_);
+
+  // Mirror of response_enabled_ for the no-subscriber path. The locked flag
+  // is the one ClaimResponseBody trusts.
+  std::atomic<bool> response_body_enabled_{false};
+  bool response_enabled_ GUARDED_BY(lock_) = false;
+  uint64_t response_generation_ GUARDED_BY(lock_) = 1;
+  ResponseBodyLimits response_limits_ GUARDED_BY(lock_);
+  int response_in_flight_ GUARDED_BY(lock_) = 0;
+  size_t response_aggregate_ GUARDED_BY(lock_) = 0;
+  uint64_t response_next_id_ GUARDED_BY(lock_) = 0;
+  // Touched only on the UI thread. Cleared before the last ref can drop on IO.
+  std::unique_ptr<ResponseBodyListener> response_body_listener_;
 };
 
 // Starts a request on the IO thread with both URLLoader endpoints proxied so
 // observer only webRequest events can be reported without blocking the load.
 void CreateObservedLoaderAndStartOnIO(
     base::WeakPtr<ElectronBrowserContext> browser_context,
+    scoped_refptr<InterceptState> state,
     int render_process_id,
     int frame_routing_id,
     mojo::PendingReceiver<network::mojom::URLLoader> loader,

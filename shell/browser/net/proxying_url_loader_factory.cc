@@ -28,6 +28,7 @@
 #include "services/network/public/mojom/url_response_head.mojom.h"
 #include "shell/browser/electron_browser_context.h"
 #include "shell/browser/net/asar/asar_url_loader_factory.h"
+#include "shell/browser/net/response_body_observer.h"
 #include "shell/browser/net/url_loader_factory_gate.h"
 #include "shell/common/options_switches.h"
 #include "third_party/abseil-cpp/absl/strings/str_format.h"
@@ -102,6 +103,11 @@ ProxyingURLLoaderFactory::InProgressRequest::InProgressRequest(
       &ProxyingURLLoaderFactory::InProgressRequest::OnRequestError,
       weak_factory_.GetWeakPtr(),
       network::URLLoaderCompletionStatus(net::ERR_ABORTED)));
+  if (factory_->browser_context_ &&
+      factory_->browser_context_->intercept_state()->response_body_enabled()) {
+    response_body_ = ResponseBodyFollow::MaybeCreate(
+        factory_->browser_context_->intercept_state(), request_.url);
+  }
 }
 
 ProxyingURLLoaderFactory::InProgressRequest::InProgressRequest(
@@ -327,6 +333,8 @@ void ProxyingURLLoaderFactory::InProgressRequest::OnTransferSizeUpdated(
 
 void ProxyingURLLoaderFactory::InProgressRequest::OnComplete(
     const network::URLLoaderCompletionStatus& status) {
+  if (response_body_)
+    response_body_->OnNetworkComplete(status.error_code);
   if (status.error_code != net::OK) {
     OnRequestError(status);
     return;
@@ -710,14 +718,20 @@ void ProxyingURLLoaderFactory::InProgressRequest::ContinueToResponseStarted(
   proxied_client_receiver_.Resume();
 
   factory_->web_request_->OnResponseStarted(&info_.value(), request_);
-  target_client_->OnReceiveResponse(current_response_.Clone(),
-                                    std::move(current_body_),
+  mojo::ScopedDataPipeConsumerHandle body = std::move(current_body_);
+  if (response_body_) {
+    body = response_body_->OnResponse(current_response_.get(),
+                                      request_.url.spec(), std::move(body));
+  }
+  target_client_->OnReceiveResponse(current_response_.Clone(), std::move(body),
                                     std::move(current_cached_metadata_));
 }
 
 void ProxyingURLLoaderFactory::InProgressRequest::ContinueToBeforeRedirect(
     const net::RedirectInfo& redirect_info,
     int error_code) {
+  if (response_body_ && error_code == net::OK)
+    response_body_->OnRedirect(request_.url.spec(), redirect_info);
   if (error_code != net::OK) {
     OnRequestError(network::URLLoaderCompletionStatus(error_code));
     return;
@@ -784,6 +798,8 @@ void ProxyingURLLoaderFactory::InProgressRequest::
 
 void ProxyingURLLoaderFactory::InProgressRequest::OnRequestError(
     const network::URLLoaderCompletionStatus& status) {
+  if (response_body_)
+    response_body_->OnNetworkComplete(status.error_code);
   if (target_client_)
     target_client_->OnComplete(status);
   factory_->web_request_->OnErrorOccurred(&info_.value(), request_,
@@ -893,11 +909,26 @@ void ProxyingURLLoaderFactory::CreateLoaderAndStart(
     if (route == InterceptState::Route::kObserve) {
       mojo::PendingRemote<network::mojom::URLLoaderFactory> observed_target;
       target_factory->Clone(observed_target.InitWithNewPipeAndPassReceiver());
+      scoped_refptr<InterceptState> state;
+      if (browser_context_)
+        state = browser_context_->intercept_state();
       CreateObservedLoaderAndStartOnIO(
-          browser_context_, render_process_id_, frame_routing_id_,
-          std::move(loader), request_id, options, request, std::move(client),
-          traffic_annotation, std::move(observed_target));
+          browser_context_, std::move(state), render_process_id_,
+          frame_routing_id_, std::move(loader), request_id, options, request,
+          std::move(client), traffic_annotation, std::move(observed_target));
       return;
+    }
+    if (browser_context_ &&
+        browser_context_->intercept_state()->response_body_enabled()) {
+      std::unique_ptr<ResponseBodyFollow> follow =
+          ResponseBodyFollow::MaybeCreate(browser_context_->intercept_state(),
+                                          request.url);
+      if (follow) {
+        StartResponseBodyLoader(std::move(follow), std::move(loader),
+                                request_id, options, request, std::move(client),
+                                traffic_annotation, target_factory.get());
+        return;
+      }
     }
     target_factory->CreateLoaderAndStart(std::move(loader), request_id, options,
                                          request, std::move(client),

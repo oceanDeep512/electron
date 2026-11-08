@@ -972,6 +972,28 @@ protocol.handle('https', (req) => {
 })
 ```
 
+#### `ses.setResponseBodyObservation(listener[, options])`
+
+<!--
+```YAML history
+added:
+  - pr-url: https://github.com/oceanDeep512/electron/pull/1
+    description: "Added a session-scoped HTTP response body listener."
+```
+-->
+
+* `listener` Function | null - Receives one [ResponseBodyObservation](structures/response-body-observation.md). Pass `null` to remove the listener.
+  * `event` [ResponseBodyObservation](structures/response-body-observation.md)
+* `options` Object (optional)
+  * `urls` string[] (optional) - Full-URL prefixes, or one `*` glob. Empty observes every `http` and `https` URL.
+  * `maxBytesPerResponse` Integer (optional) - Default `1000000`, maximum `10000000`.
+  * `maxInFlight` Integer (optional) - Default `8`, maximum `64`.
+  * `maxAggregateBytes` Integer (optional) - Default `8000000`, maximum `64000000`.
+
+One listener per `Session`. A second call replaces it. `agentRuntime` session `observeResponses()` is the supported way to subscribe more than once; it fans one native listener out in JavaScript.
+
+The listener is given response bytes on purpose. Electron does not redact the body and does not persist it. No listener means the direct renderer-to-network path is left unchanged. A full buffer, a full in-flight set, or a failure to create the tee pipe skips that capture and does not fail the request. Redirects carry no body.
+
 #### `ses.disableNetworkEmulation()`
 
 Disables any network emulation already active for the `session`. Resets to

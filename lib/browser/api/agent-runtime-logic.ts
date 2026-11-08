@@ -15,9 +15,10 @@ export const checkpoint = Object.freeze({
   controlPlane: true,
   nativePersona: false,
   // The snapshot API is wired to WebContents::RequestAXTreeSnapshot.
-  // HTTP response bodies and WebSocket message bodies are not.
+  // Response bodies are tee'd from the URL loader data pipe.
+  // WebSocket message bodies are not.
   accessibilitySnapshot: true,
-  responseBodyObservation: false,
+  responseBodyObservation: true,
   webSocketMessageObservation: false
 } as const);
 
@@ -48,6 +49,7 @@ export type AgentErrorCode =
   | 'invalid-size'
   | 'invalid-snapshot'
   | 'snapshot-failed'
+  | 'invalid-response-observation'
   | 'page-script-failed';
 
 export class AgentRuntimeError extends Error {
@@ -1195,5 +1197,202 @@ export function assembleAXSnapshot(value: unknown): AXSnapshot {
     crossFrameBounds: 'relative-chain-without-transforms',
     crossOriginStitch: 'linked-when-parent-tree-id-matches',
     nodes
+  };
+}
+
+// Kept in sync with kResponseBody* in shell/browser/net/url_loader_factory_gate.h.
+export const RESPONSE_DEFAULT_MAX_BYTES = 1_000_000;
+export const RESPONSE_MAX_BYTES = 10_000_000;
+export const RESPONSE_DEFAULT_MAX_IN_FLIGHT = 8;
+export const RESPONSE_MAX_IN_FLIGHT = 64;
+export const RESPONSE_DEFAULT_AGGREGATE_BYTES = 8_000_000;
+export const RESPONSE_MAX_AGGREGATE_BYTES = 64_000_000;
+
+export interface ResponseObservationPolicy {
+  urls: string[];
+  maxBytesPerResponse: number;
+  maxInFlight: number;
+  maxAggregateBytes: number;
+}
+
+export interface ResponseObservationBudget {
+  inFlight: number;
+  openedIds: Set<string>;
+  skippedIds: Set<string>;
+}
+
+export interface ResponseObservationEvent {
+  requestId: string;
+  phase: 'opened' | 'redirect' | 'completed' | 'aborted' | 'skipped';
+  url: string;
+  redirectUrl: string;
+  status: number;
+  mimeType: string;
+  networkDecoded: boolean;
+  truncated: boolean;
+  skipReason: '' | 'in-flight-limit' | 'aggregate-limit' | 'tee-failed';
+  errorCode: number;
+  body: Uint8Array | null;
+}
+
+const RESPONSE_PHASES = new Set(['opened', 'redirect', 'completed', 'aborted', 'skipped']);
+
+function invalidResponse(message: string): AgentRuntimeError {
+  return new AgentRuntimeError('invalid-response-observation', message);
+}
+
+function isInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value);
+}
+
+function readLimit(value: unknown, name: string, min: number, max: number, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (!isInteger(value) || value < min || value > max) {
+    throw invalidResponse(`${name} must be an integer from ${min} to ${max}`);
+  }
+  return value;
+}
+
+// Empty patterns match every http(s) URL. A pattern is a URL prefix, or a
+// prefix and suffix around one star. The match is against the full URL.
+export function responseUrlMatches(patterns: readonly string[], url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+  if (patterns.length === 0) return true;
+  for (const pattern of patterns) {
+    const star = pattern.indexOf('*');
+    if (star === -1) {
+      if (url.startsWith(pattern)) return true;
+      continue;
+    }
+    const prefix = pattern.slice(0, star);
+    const suffix = pattern.slice(star + 1);
+    if (url.length >= prefix.length + suffix.length && url.startsWith(prefix) && url.endsWith(suffix)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function normalizeResponseObservation(options: unknown): ResponseObservationPolicy {
+  const record = options === undefined ? {} : options;
+  if (record === null || typeof record !== 'object' || Array.isArray(record)) {
+    throw invalidResponse('Response observation options must be an object');
+  }
+  const value = record as {
+    urls?: unknown;
+    maxBytesPerResponse?: unknown;
+    maxInFlight?: unknown;
+    maxAggregateBytes?: unknown;
+  };
+  const urls: string[] = [];
+  if (value.urls !== undefined) {
+    if (!Array.isArray(value.urls) || value.urls.length > 32) {
+      throw invalidResponse('urls must be an array of at most 32 strings');
+    }
+    for (const pattern of value.urls) {
+      if (typeof pattern !== 'string' || pattern.length < 1 || pattern.length > 2048 || pattern.split('*').length > 2) {
+        throw invalidResponse('A url pattern must be 1 to 2048 characters and contain at most one *');
+      }
+      urls.push(pattern);
+    }
+  }
+  return {
+    urls,
+    maxBytesPerResponse: readLimit(value.maxBytesPerResponse, 'maxBytesPerResponse', 1, RESPONSE_MAX_BYTES, RESPONSE_DEFAULT_MAX_BYTES),
+    maxInFlight: readLimit(value.maxInFlight, 'maxInFlight', 1, RESPONSE_MAX_IN_FLIGHT, RESPONSE_DEFAULT_MAX_IN_FLIGHT),
+    maxAggregateBytes: readLimit(value.maxAggregateBytes, 'maxAggregateBytes', 1, RESPONSE_MAX_AGGREGATE_BYTES, RESPONSE_DEFAULT_AGGREGATE_BYTES)
+  };
+}
+
+export function unionResponseObservationPolicies(policies: readonly ResponseObservationPolicy[]): ResponseObservationPolicy {
+  if (policies.length === 0) {
+    throw invalidResponse('At least one response observation policy is required');
+  }
+  const urls = policies.some((policy) => policy.urls.length === 0)
+    ? []
+    : [...new Set(policies.flatMap((policy) => policy.urls))];
+  return {
+    urls,
+    maxBytesPerResponse: Math.max(...policies.map((policy) => policy.maxBytesPerResponse)),
+    maxInFlight: Math.max(...policies.map((policy) => policy.maxInFlight)),
+    maxAggregateBytes: Math.max(...policies.map((policy) => policy.maxAggregateBytes))
+  };
+}
+
+export function createResponseObservationBudget(): ResponseObservationBudget {
+  return { inFlight: 0, openedIds: new Set(), skippedIds: new Set() };
+}
+
+function copyBytes(body: Uint8Array | null, maxBytes: number): { body: Uint8Array; truncated: boolean } {
+  const source = body ?? new Uint8Array();
+  if (source.byteLength <= maxBytes) return { body: new Uint8Array(source), truncated: false };
+  return { body: new Uint8Array(source.subarray(0, maxBytes)), truncated: true };
+}
+
+function releaseOpened(budget: ResponseObservationBudget, requestId: string): void {
+  if (budget.openedIds.delete(requestId) && budget.inFlight > 0) budget.inFlight -= 1;
+}
+
+// Production delivery for one subscriber. A redirect never carries a body.
+// A listener over its own in-flight cap is told with skipReason and does not
+// receive the bytes. The network request is unaffected.
+export function applyResponseObservation(
+  policy: ResponseObservationPolicy,
+  budget: ResponseObservationBudget,
+  event: ResponseObservationEvent
+): ResponseObservationEvent | null {
+  if (!RESPONSE_PHASES.has(event.phase)) return null;
+  if (event.phase !== 'skipped' && !responseUrlMatches(policy.urls, event.url)) return null;
+  if (event.phase === 'redirect') {
+    return { ...event, body: null, truncated: false, skipReason: '' };
+  }
+  if (event.phase === 'skipped') {
+    budget.skippedIds.delete(event.requestId);
+    releaseOpened(budget, event.requestId);
+    return { ...event, body: null, truncated: false };
+  }
+  if (event.phase === 'opened') {
+    if (budget.skippedIds.has(event.requestId)) return null;
+    if (budget.inFlight >= policy.maxInFlight) {
+      budget.skippedIds.add(event.requestId);
+      return {
+        ...event,
+        phase: 'skipped',
+        body: null,
+        truncated: false,
+        skipReason: 'in-flight-limit'
+      };
+    }
+    if (event.body !== null && event.body.byteLength > policy.maxAggregateBytes) {
+      budget.skippedIds.add(event.requestId);
+      return {
+        ...event,
+        phase: 'skipped',
+        body: null,
+        truncated: false,
+        skipReason: 'aggregate-limit'
+      };
+    }
+    budget.inFlight += 1;
+    budget.openedIds.add(event.requestId);
+    return { ...event, body: null, truncated: false, skipReason: '' };
+  }
+  if (budget.skippedIds.delete(event.requestId)) {
+    releaseOpened(budget, event.requestId);
+    return null;
+  }
+  releaseOpened(budget, event.requestId);
+  const copied = copyBytes(event.body, Math.min(policy.maxBytesPerResponse, policy.maxAggregateBytes));
+  return {
+    ...event,
+    body: copied.body,
+    truncated: event.truncated || copied.truncated,
+    skipReason: ''
   };
 }

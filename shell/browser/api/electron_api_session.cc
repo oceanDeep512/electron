@@ -80,6 +80,8 @@
 #include "shell/browser/javascript_environment.h"
 #include "shell/browser/media/media_device_id_salt.h"
 #include "shell/browser/net/cert_verifier_client.h"
+#include "shell/browser/net/response_body_observer.h"
+#include "shell/browser/net/url_loader_factory_gate.h"
 #include "shell/browser/net/resolve_host_function.h"
 #include "shell/browser/net/resolve_proxy_helper.h"
 #include "shell/browser/session_preferences.h"
@@ -624,6 +626,8 @@ Session::Session(v8::Isolate* isolate, ElectronBrowserContext* browser_context)
 }
 
 Session::~Session() {
+  if (browser_context_ && browser_context_->intercept_state())
+    browser_context_->intercept_state()->ClearResponseBodyObservation();
   Dispose();
 }
 
@@ -952,6 +956,82 @@ void Session::SetPermissionRequestHandler(v8::Local<v8::Value> val,
                      details);
       },
       base::Owned(std::move(handler))));
+}
+
+void Session::SetResponseBodyObservation(v8::Local<v8::Value> listener,
+                                         gin::Arguments* args) {
+  if (!browser_context_ || !browser_context_->intercept_state()) {
+    args->ThrowTypeError("The session has been destroyed");
+    return;
+  }
+  InterceptState* state = browser_context_->intercept_state();
+  if (listener->IsNull() || listener->IsUndefined()) {
+    state->ClearResponseBodyObservation();
+    return;
+  }
+  if (!listener->IsFunction()) {
+    args->ThrowTypeError("Must pass null or a function");
+    return;
+  }
+
+  ResponseBodyLimits limits;
+  v8::Local<v8::Value> options;
+  if (args->GetNext(&options) && !options->IsNullOrUndefined()) {
+    if (!options->IsObject()) {
+      args->ThrowTypeError("Response observation options must be an object");
+      return;
+    }
+    gin_helper::Dictionary dict(args->isolate(), options.As<v8::Object>());
+    if (dict.Has("urls")) {
+      std::vector<std::string> urls;
+      if (!dict.Get("urls", &urls) || urls.size() > 32) {
+        args->ThrowTypeError("urls must be an array of at most 32 strings");
+        return;
+      }
+      for (const std::string& pattern : urls) {
+        if (!IsValidResponseBodyPattern(pattern)) {
+          args->ThrowTypeError(
+              "A url pattern must be 1 to 2048 characters and contain at most "
+              "one *");
+          return;
+        }
+      }
+      limits.patterns = std::move(urls);
+    }
+    if (dict.Has("maxBytesPerResponse")) {
+      int value = 0;
+      if (!dict.Get("maxBytesPerResponse", &value) || value < 1 ||
+          static_cast<size_t>(value) > kResponseBodyMaxBytes) {
+        args->ThrowTypeError(
+            "maxBytesPerResponse must be an integer from 1 to 10000000");
+        return;
+      }
+      limits.max_bytes_per_response = static_cast<size_t>(value);
+    }
+    if (dict.Has("maxInFlight")) {
+      int value = 0;
+      if (!dict.Get("maxInFlight", &value) || value < 1 ||
+          value > kResponseBodyMaxInFlight) {
+        args->ThrowTypeError("maxInFlight must be an integer from 1 to 64");
+        return;
+      }
+      limits.max_in_flight = value;
+    }
+    if (dict.Has("maxAggregateBytes")) {
+      int value = 0;
+      if (!dict.Get("maxAggregateBytes", &value) || value < 1 ||
+          static_cast<size_t>(value) > kResponseBodyMaxAggregateBytes) {
+        args->ThrowTypeError(
+            "maxAggregateBytes must be an integer from 1 to 64000000");
+        return;
+      }
+      limits.max_aggregate_bytes = static_cast<size_t>(value);
+    }
+  }
+
+  ConfigureResponseBodyObservation(state, args->isolate(),
+                                  listener.As<v8::Function>(),
+                                  std::move(limits));
 }
 
 void Session::SetPermissionCheckHandler(v8::Local<v8::Value> val,
@@ -1886,6 +1966,8 @@ void Session::FillObjectTemplate(v8::Isolate* isolate,
           "setPermissionRequestHandler")
       .SetMethod<&Session::SetPermissionCheckHandler>(
           "setPermissionCheckHandler")
+      .SetMethod<&Session::SetResponseBodyObservation>(
+          "setResponseBodyObservation")
       .SetMethod<&Session::SetDisplayMediaRequestHandler>(
           "setDisplayMediaRequestHandler")
       .SetMethod<&Session::SetDevicePermissionHandler>(

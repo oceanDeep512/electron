@@ -6,6 +6,7 @@ import {
   CONTENT_SCRIPT,
   ELEMENT_SCRIPT,
   applyNavigationEvent,
+  applyResponseObservation,
   assembleAXSnapshot,
   assertClickable,
   assertContentMaxChars,
@@ -25,9 +26,11 @@ import {
   createEffectGate,
   createListenerSet,
   createNavigation,
+  createResponseObservationBudget,
   cssPointToWidgetDip,
   decidePersona,
   hostEffectAllowed,
+  normalizeResponseObservation,
   ownedWebPreferences,
   performHostEffect,
   planKey,
@@ -38,9 +41,13 @@ import {
   releaseSlot,
   resolvePartition,
   settleEffectGate,
+  unionResponseObservationPolicies,
   validatePersona,
   type AgentErrorCode,
   type AXSnapshot,
+  type ResponseObservationBudget,
+  type ResponseObservationEvent,
+  type ResponseObservationPolicy,
   type EffectGate,
   type ElementBox,
   type NavigationStatus,
@@ -85,6 +92,33 @@ interface PageApi {
   close(): void;
 }
 
+interface NativeResponseEvent {
+  requestId: string;
+  phase: string;
+  url: string;
+  redirectUrl: string;
+  status: number;
+  mimeType: string;
+  networkDecoded: boolean;
+  truncated: boolean;
+  skipReason: string;
+  errorCode: number;
+  body: Uint8Array | null;
+}
+
+interface NativeResponseSession {
+  setResponseBodyObservation(
+    listener: ((event: NativeResponseEvent) => void) | null,
+    options?: ResponseObservationPolicy
+  ): void;
+}
+
+interface ResponseSubscriber {
+  policy: ResponseObservationPolicy;
+  budget: ResponseObservationBudget;
+  listener: (event: ResponseObservationEvent) => void;
+}
+
 interface SessionApi {
   readonly personaApplied: false;
   readonly personaId: null;
@@ -93,6 +127,15 @@ interface SessionApi {
   readonly session: Session;
   readonly isClosed: boolean;
   createPage(options?: { webContents?: WebContents; show?: boolean; width?: number; height?: number }): PageApi;
+  observeResponses(
+    options: {
+      urls?: string[];
+      maxBytesPerResponse?: number;
+      maxInFlight?: number;
+      maxAggregateBytes?: number;
+    } | undefined,
+    listener: (event: ResponseObservationEvent) => void
+  ): () => void;
   close(): void;
 }
 
@@ -489,11 +532,43 @@ function publishPage(page: AgentPage): PageApi {
   };
 }
 
+function asResponseEvent(event: NativeResponseEvent): ResponseObservationEvent | null {
+  if (
+    event.phase !== 'opened' &&
+    event.phase !== 'redirect' &&
+    event.phase !== 'completed' &&
+    event.phase !== 'aborted' &&
+    event.phase !== 'skipped'
+  ) {
+    return null;
+  }
+  const skipReason = event.skipReason === 'in-flight-limit' ||
+    event.skipReason === 'aggregate-limit' ||
+    event.skipReason === 'tee-failed'
+    ? event.skipReason
+    : '';
+  return {
+    requestId: event.requestId,
+    phase: event.phase,
+    url: event.url,
+    redirectUrl: event.redirectUrl,
+    status: event.status,
+    mimeType: event.mimeType,
+    networkDecoded: event.networkDecoded,
+    truncated: event.truncated,
+    skipReason,
+    errorCode: event.errorCode,
+    body: event.body
+  };
+}
+
 class AgentSession {
   readonly personaApplied = false as const;
   readonly personaId = null;
   readonly api: SessionApi;
   private readonly pages = new Set<AgentPage>();
+  private readonly responseSubscribers = new Set<ResponseSubscriber>();
+  private responseNativeInstalled = false;
   private closed = false;
 
   constructor(
@@ -517,6 +592,7 @@ class AgentSession {
         return self.isClosed;
       },
       createPage: (options) => publishPage(self.createPage(options)),
+      observeResponses: (options, listener) => self.observeResponses(options, listener),
       close: () => self.close()
     };
   }
@@ -572,9 +648,76 @@ class AgentSession {
     }
   }
 
+  observeResponses(
+    options: {
+      urls?: string[];
+      maxBytesPerResponse?: number;
+      maxInFlight?: number;
+      maxAggregateBytes?: number;
+    } | undefined,
+    listener: (event: ResponseObservationEvent) => void
+  ): () => void {
+    if (this.closed) throw failure('closed', 'The session has been closed');
+    if (typeof listener !== 'function') {
+      throw failure('invalid-response-observation', 'listener must be a function');
+    }
+    const policy = normalizeResponseObservation(options);
+    const subscriber: ResponseSubscriber = {
+      policy,
+      budget: createResponseObservationBudget(),
+      listener
+    };
+    this.responseSubscribers.add(subscriber);
+    this.pushResponseObservation();
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.responseSubscribers.delete(subscriber);
+      if (!this.closed) this.pushResponseObservation();
+    };
+  }
+
+  private pushResponseObservation(): void {
+    const native = this.session as Session & NativeResponseSession;
+    if (this.responseSubscribers.size === 0) {
+      if (this.responseNativeInstalled) {
+        native.setResponseBodyObservation(null);
+        this.responseNativeInstalled = false;
+      }
+      return;
+    }
+    const policy = unionResponseObservationPolicies(
+      [...this.responseSubscribers].map((subscriber) => subscriber.policy)
+    );
+    native.setResponseBodyObservation((event) => {
+      this.dispatchResponseObservation(event);
+    }, policy);
+    this.responseNativeInstalled = true;
+  }
+
+  private dispatchResponseObservation(raw: NativeResponseEvent): void {
+    const event = asResponseEvent(raw);
+    if (!event) return;
+    for (const subscriber of [...this.responseSubscribers]) {
+      const presented = applyResponseObservation(subscriber.policy, subscriber.budget, event);
+      if (!presented) continue;
+      try {
+        subscriber.listener(presented);
+      } catch {
+        // A listener exception can include the response. Do not log the event.
+      }
+    }
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    this.responseSubscribers.clear();
+    if (this.responseNativeInstalled) {
+      (this.session as Session & NativeResponseSession).setResponseBodyObservation(null);
+      this.responseNativeInstalled = false;
+    }
     for (const page of [...this.pages]) page.close();
     sessions.delete(this.storagePartition);
   }
