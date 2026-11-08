@@ -47,7 +47,7 @@ An `Object` frozen record of the pinned baseline and which stages are present in
 * `nativePersona` boolean - `false`. A persona is not applied.
 * `accessibilitySnapshot` boolean - `true` when `page.snapshot()` is wired to `WebContents::RequestAXTreeSnapshot`.
 * `responseBodyObservation` boolean - `true` when `session.observeResponses()` is wired to the URL loader tee.
-* `webSocketMessageObservation` boolean - `false`.
+* `webSocketMessageObservation` boolean - `true` when `session.observeWebSockets()` is wired to the WebSocket forwarder.
 
 ### `agentRuntime.AgentRuntimeError` _Readonly_
 
@@ -162,11 +162,39 @@ Observation is opt-in and session scoped. With no listeners, renderer requests s
 
 `body` is a copy of the bytes on the network data pipe. For an ordinary page or `fetch` request those are the bytes `URLRequest::Read` produced after Chromium's content-encoding filter. `networkDecoded` is false when the request asked for client-side content decoding; the bytes are still copied unchanged. A `redirect` event has `body: null` and does not stand in for the final response. A `skipped` event means this response was not captured. The page's request still completes.
 
-Hitting a capture limit does not fail or stall the request. `truncated: true` means only a prefix was delivered to the listener. `skipReason` tells why a response was not captured.
+Hitting a capture limit does not fail or stall the request. `truncated: true` means only a prefix was delivered to the listener. `skipReason` tells why a response was not captured. `queueDropped` counts observation events discarded because the UI queue was full.
+
+This is not a capture of every network response. It does not see requests that leave `WillCreateURLLoaderFactory` through the extensions early return, CORS preflights, `file:` URLs, custom protocols, or WebSocket.
+
+#### `session.observeWebSockets(options, listener)`
+
+<!--
+```YAML history
+added:
+  - pr-url: https://github.com/oceanDeep512/electron/pull/1
+    description: "Added bounded WebSocket message observation."
+```
+-->
+
+* `options` Object
+  * `urls` string[] (optional) - Full-URL prefixes, or a prefix and suffix around one `*`. An empty list observes every `ws` and `wss` URL. At most 32 patterns, each 1 to 2048 characters and at most one `*`.
+  * `maxBytesPerMessage` Integer (optional) - Captured prefix per message. Default is `1000000`. Must be from 1 to 10000000.
+  * `maxInFlight` Integer (optional) - Connections captured at once. Default is `8`. Must be from 1 to 64. Further connections are skipped.
+  * `maxAggregateBytes` Integer (optional) - Bytes held for in-flight captures. Default is `8000000`. Must be from 1 to 64000000.
+* `listener` Function
+  * `event` [WebSocketMessageObservation](structures/websocket-message-observation.md)
+
+Returns `Function` - Call the returned function to remove this listener. The last listener turns observation off for the session.
+
+Observation is opt-in and session scoped. With no listeners, page and dedicated-worker sockets are not proxied for messages. The listener receives message bytes, which may contain secrets. This method does not redact them and does not write them to disk or to a log.
+
+`body` is the logical message. Incoming frames are the bytes `net::WebSocketChannel` delivered after `WebSocketDeflateStream` inflation. Outgoing bytes are what the renderer wrote before the network service deflates them. `wireCompressed` is true when the handshake extensions include `permessage-deflate`. `text` is set only for a complete, valid UTF-8 text message. A truncated or invalid text message keeps `text` null and still carries the captured bytes. Ping and pong are not events. A redirect-style event is not synthesized.
+
+Shared workers, service workers, and `net.WebSocket` are outside this path. Extension websocket proxies are also outside it. Handshake failure emits `failed` and no body. A capture limit skips or truncates the copy and does not drop the socket's real frames.
 
 #### `session.close()`
 
-Closes every page handle, removes response listeners, and stops new captures. Owned windows are destroyed. Adopted `WebContents` are not destroyed. The in-memory session record is dropped. A capture already in flight keeps forwarding bytes to the page and does not deliver them after the listener is gone.
+Closes every page handle, removes response and WebSocket listeners, and stops new captures. Owned windows are destroyed. Adopted `WebContents` are not destroyed. The in-memory session record is dropped. A capture already in flight keeps forwarding bytes to the page or socket and does not deliver them after the listener is gone.
 
 ## Class: AgentPage
 

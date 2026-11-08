@@ -42,12 +42,19 @@ import {
   resolvePartition,
   settleEffectGate,
   unionResponseObservationPolicies,
+  applyWebSocketObservation,
+  createWebSocketObservationBudget,
+  normalizeWebSocketObservation,
+  unionWebSocketObservationPolicies,
   validatePersona,
   type AgentErrorCode,
   type AXSnapshot,
   type ResponseObservationBudget,
   type ResponseObservationEvent,
   type ResponseObservationPolicy,
+  type WebSocketObservationBudget,
+  type WebSocketObservationEvent,
+  type WebSocketObservationPolicy,
   type EffectGate,
   type ElementBox,
   type NavigationStatus,
@@ -103,6 +110,7 @@ interface NativeResponseEvent {
   truncated: boolean;
   skipReason: string;
   errorCode: number;
+  queueDropped: number;
   body: Uint8Array | null;
 }
 
@@ -111,12 +119,43 @@ interface NativeResponseSession {
     listener: ((event: NativeResponseEvent) => void) | null,
     options?: ResponseObservationPolicy
   ): void;
+  updateResponseBodyObservationLimits(options: ResponseObservationPolicy): void;
+  setWebSocketMessageObservation(
+    listener: ((event: NativeWebSocketEvent) => void) | null,
+    options?: WebSocketObservationPolicy
+  ): void;
+  updateWebSocketMessageObservationLimits(options: WebSocketObservationPolicy): void;
+}
+
+interface NativeWebSocketEvent {
+  phase: string;
+  connectionId: string;
+  messageId: string;
+  url: string;
+  direction: string;
+  opcode: string;
+  truncated: boolean;
+  text: string | null;
+  skipReason: string;
+  wireCompressed: boolean;
+  wasClean: boolean;
+  code: number;
+  reason: string;
+  errorCode: number;
+  queueDropped?: number;
+  body: Uint8Array | null;
 }
 
 interface ResponseSubscriber {
   policy: ResponseObservationPolicy;
   budget: ResponseObservationBudget;
   listener: (event: ResponseObservationEvent) => void;
+}
+
+interface SocketSubscriber {
+  policy: WebSocketObservationPolicy;
+  budget: WebSocketObservationBudget;
+  listener: (event: WebSocketObservationEvent) => void;
 }
 
 interface SessionApi {
@@ -135,6 +174,15 @@ interface SessionApi {
       maxAggregateBytes?: number;
     } | undefined,
     listener: (event: ResponseObservationEvent) => void
+  ): () => void;
+  observeWebSockets(
+    options: {
+      urls?: string[];
+      maxBytesPerMessage?: number;
+      maxInFlight?: number;
+      maxAggregateBytes?: number;
+    } | undefined,
+    listener: (event: WebSocketObservationEvent) => void
   ): () => void;
   close(): void;
 }
@@ -532,6 +580,46 @@ function publishPage(page: AgentPage): PageApi {
   };
 }
 
+function asWebSocketEvent(event: NativeWebSocketEvent): WebSocketObservationEvent | null {
+  if (
+    event.phase !== 'opened' &&
+    event.phase !== 'message' &&
+    event.phase !== 'closed' &&
+    event.phase !== 'failed' &&
+    event.phase !== 'skipped'
+  ) {
+    return null;
+  }
+  const direction = event.direction === 'received' || event.direction === 'sent' ? event.direction : '';
+  const opcode = event.opcode === 'text' || event.opcode === 'binary' || event.opcode === 'continuation'
+    ? event.opcode
+    : '';
+  const skipReason = event.skipReason === 'in-flight-limit' ||
+    event.skipReason === 'aggregate-limit' ||
+    event.skipReason === 'tee-failed' ||
+    event.skipReason === 'dispatch-queue'
+    ? event.skipReason
+    : '';
+  return {
+    connectionId: event.connectionId,
+    messageId: event.messageId,
+    phase: event.phase,
+    url: event.url,
+    direction,
+    opcode,
+    body: event.body,
+    text: typeof event.text === 'string' ? event.text : null,
+    truncated: event.truncated,
+    skipReason,
+    wireCompressed: event.wireCompressed,
+    wasClean: event.wasClean,
+    code: event.code,
+    reason: event.reason,
+    errorCode: event.errorCode,
+    queueDropped: typeof event.queueDropped === 'number' ? event.queueDropped : 0
+  };
+}
+
 function asResponseEvent(event: NativeResponseEvent): ResponseObservationEvent | null {
   if (
     event.phase !== 'opened' &&
@@ -544,7 +632,8 @@ function asResponseEvent(event: NativeResponseEvent): ResponseObservationEvent |
   }
   const skipReason = event.skipReason === 'in-flight-limit' ||
     event.skipReason === 'aggregate-limit' ||
-    event.skipReason === 'tee-failed'
+    event.skipReason === 'tee-failed' ||
+    event.skipReason === 'dispatch-queue'
     ? event.skipReason
     : '';
   return {
@@ -558,6 +647,7 @@ function asResponseEvent(event: NativeResponseEvent): ResponseObservationEvent |
     truncated: event.truncated,
     skipReason,
     errorCode: event.errorCode,
+    queueDropped: typeof event.queueDropped === 'number' ? event.queueDropped : 0,
     body: event.body
   };
 }
@@ -569,6 +659,8 @@ class AgentSession {
   private readonly pages = new Set<AgentPage>();
   private readonly responseSubscribers = new Set<ResponseSubscriber>();
   private responseNativeInstalled = false;
+  private readonly socketSubscribers = new Set<SocketSubscriber>();
+  private socketNativeInstalled = false;
   private closed = false;
 
   constructor(
@@ -593,6 +685,7 @@ class AgentSession {
       },
       createPage: (options) => publishPage(self.createPage(options)),
       observeResponses: (options, listener) => self.observeResponses(options, listener),
+      observeWebSockets: (options, listener) => self.observeWebSockets(options, listener),
       close: () => self.close()
     };
   }
@@ -690,6 +783,10 @@ class AgentSession {
     const policy = unionResponseObservationPolicies(
       [...this.responseSubscribers].map((subscriber) => subscriber.policy)
     );
+    if (this.responseNativeInstalled) {
+      native.updateResponseBodyObservationLimits(policy);
+      return;
+    }
     native.setResponseBodyObservation((event) => {
       this.dispatchResponseObservation(event);
     }, policy);
@@ -710,13 +807,85 @@ class AgentSession {
     }
   }
 
+  observeWebSockets(
+    options: {
+      urls?: string[];
+      maxBytesPerMessage?: number;
+      maxInFlight?: number;
+      maxAggregateBytes?: number;
+    } | undefined,
+    listener: (event: WebSocketObservationEvent) => void
+  ): () => void {
+    if (this.closed) throw failure('closed', 'The session has been closed');
+    if (typeof listener !== 'function') {
+      throw failure('invalid-websocket-observation', 'listener must be a function');
+    }
+    const policy = normalizeWebSocketObservation(options);
+    const subscriber: SocketSubscriber = {
+      policy,
+      budget: createWebSocketObservationBudget(),
+      listener
+    };
+    this.socketSubscribers.add(subscriber);
+    this.pushWebSocketObservation();
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.socketSubscribers.delete(subscriber);
+      if (!this.closed) this.pushWebSocketObservation();
+    };
+  }
+
+  private pushWebSocketObservation(): void {
+    const native = this.session as Session & NativeResponseSession;
+    if (this.socketSubscribers.size === 0) {
+      if (this.socketNativeInstalled) {
+        native.setWebSocketMessageObservation(null);
+        this.socketNativeInstalled = false;
+      }
+      return;
+    }
+    const policy = unionWebSocketObservationPolicies(
+      [...this.socketSubscribers].map((subscriber) => subscriber.policy)
+    );
+    if (this.socketNativeInstalled) {
+      native.updateWebSocketMessageObservationLimits(policy);
+      return;
+    }
+    native.setWebSocketMessageObservation((event) => {
+      this.dispatchWebSocketObservation(event);
+    }, policy);
+    this.socketNativeInstalled = true;
+  }
+
+  private dispatchWebSocketObservation(raw: NativeWebSocketEvent): void {
+    const event = asWebSocketEvent(raw);
+    if (!event) return;
+    for (const subscriber of [...this.socketSubscribers]) {
+      const presented = applyWebSocketObservation(subscriber.policy, subscriber.budget, event);
+      if (!presented) continue;
+      try {
+        subscriber.listener(presented);
+      } catch {
+        // A listener exception can include the payload. Do not log the event.
+      }
+    }
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
     this.responseSubscribers.clear();
+    this.socketSubscribers.clear();
+    const native = this.session as Session & NativeResponseSession;
     if (this.responseNativeInstalled) {
-      (this.session as Session & NativeResponseSession).setResponseBodyObservation(null);
+      native.setResponseBodyObservation(null);
       this.responseNativeInstalled = false;
+    }
+    if (this.socketNativeInstalled) {
+      native.setWebSocketMessageObservation(null);
+      this.socketNativeInstalled = false;
     }
     for (const page of [...this.pages]) page.close();
     sessions.delete(this.storagePartition);

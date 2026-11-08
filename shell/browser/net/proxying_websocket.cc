@@ -10,6 +10,8 @@
 #include "base/strings/string_util.h"
 #include "content/public/browser/browser_thread.h"
 #include "content/public/browser/global_routing_id.h"
+#include "shell/browser/electron_browser_context.h"
+#include "shell/browser/net/websocket_message_observer.h"
 #include "extensions/browser/extension_navigation_ui_data.h"
 #include "net/base/ip_endpoint.h"
 #include "services/network/public/mojom/url_response_head.mojom.h"
@@ -35,6 +37,7 @@ ProxyingWebSocket::ProxyingWebSocket(
       request_headers_(request.headers),
       response_(network::mojom::URLResponseHead::New()),
       has_extra_headers_(has_extra_headers),
+      browser_context_(static_cast<ElectronBrowserContext*>(browser_context)),
       info_(extensions::WebRequestInfoInitParams(
           ++(*request_id_generator),
           content::GlobalRenderFrameHostId(process_id, render_frame_id),
@@ -153,12 +156,19 @@ void ProxyingWebSocket::ContinueToCompleted() {
   DCHECK(forwarding_handshake_client_);
   DCHECK(is_done_);
   web_request_->OnCompleted(&info_, request_, net::ERR_WS_UPGRADE);
+  std::string extensions;
+  if (handshake_response_)
+    extensions = handshake_response_->extensions;
+  WebSocketRendererEnds ends = ObserveWebSocketConnection(
+      browser_context_ ? browser_context_->intercept_state() : nullptr,
+      info_.url, extensions, std::move(websocket_), std::move(client_receiver_),
+      std::move(readable_), std::move(writable_));
   forwarding_handshake_client_->OnConnectionEstablished(
-      std::move(websocket_), std::move(client_receiver_),
-      std::move(handshake_response_), std::move(readable_),
-      std::move(writable_));
+      std::move(ends.socket), std::move(ends.client_receiver),
+      std::move(handshake_response_), std::move(ends.readable),
+      std::move(ends.writable));
 
-  // Deletes |this|.
+  // Deletes |this|. Message forwarding, when claimed, lives in the forwarder.
   delete this;
 }
 
@@ -437,6 +447,10 @@ void ProxyingWebSocket::OnError(int error_code) {
   if (!is_done_) {
     is_done_ = true;
     web_request_->OnErrorOccurred(&info_, request_, error_code);
+    if (browser_context_ && browser_context_->intercept_state()) {
+      NotifyWebSocketHandshakeFailed(browser_context_->intercept_state(),
+                                     info_.url, error_code);
+    }
   }
 
   // Deletes |this|.

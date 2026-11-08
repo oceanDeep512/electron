@@ -29,6 +29,8 @@ class Origin;
 
 namespace electron {
 
+class ElectronBrowserContext;
+
 // A ProxyingWebSocket proxies a WebSocket connection and dispatches
 // WebRequest API events.
 //
@@ -153,6 +155,7 @@ class ProxyingWebSocket : public network::mojom::WebSocketHandshakeClient,
   OnHeadersReceivedCallback on_headers_received_callback_;
 
   GURL redirect_url_;
+  ElectronBrowserContext* browser_context_ = nullptr;
   bool is_done_ = false;
   bool has_extra_headers_;
   mojo::PendingRemote<network::mojom::WebSocket> websocket_;

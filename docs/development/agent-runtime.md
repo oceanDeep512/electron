@@ -1,6 +1,6 @@
 # Agent Runtime
 
-This page records the third checkpoint of the agent runtime. The control plane and accessibility snapshots remain, and HTTP response bodies can be observed from the session. Native fingerprint persona and WebSocket message bodies are still not implemented. The C++ for snapshots and response bodies is source only: it has not been compiled or run.
+This page records the fourth checkpoint of the agent runtime. The control plane, accessibility snapshots, and HTTP response bodies remain, and page WebSocket messages can be observed from the session. Native fingerprint persona is still not implemented. The C++ for snapshots, response bodies, and WebSocket forwarding is source only: it has not been compiled or run.
 
 ## Status of this checkpoint
 
@@ -14,9 +14,9 @@ This page records the third checkpoint of the agent runtime. The control plane a
 | Applying a fingerprint persona | Not implemented. `createSession` rejects a persona |
 | Accessibility snapshot | Wired to `WebContents::RequestAXTreeSnapshot`. Source only, not compiled |
 | HTTP response body observation | Wired through `session.observeResponses()`. Source only, not compiled |
-| WebSocket message body observation | Not implemented |
+| WebSocket message observation | Wired through `session.observeWebSockets()` for page and dedicated-worker sockets. Source only, not compiled |
 
-`electron.agentRuntime.checkpoint` exposes the same flags at runtime. `accessibilitySnapshot` and `responseBodyObservation` are true. `nativePersona` and `webSocketMessageObservation` are false.
+`electron.agentRuntime.checkpoint` exposes the same flags at runtime. `accessibilitySnapshot`, `responseBodyObservation`, and `webSocketMessageObservation` are true. `nativePersona` is false.
 
 ## Pinned baseline
 
@@ -109,32 +109,45 @@ The click point is the CSS box center multiplied by `webContents.zoomFactor`, th
 
 A matching `http` or `https` request is claimed once. The gate's direct branch and the proxy's direct branch insert `ResponseBodyURLLoader` only after that claim. `kObserve` tees inside `ObservedURLLoader`. `kProxy` tees when `InProgressRequest` forwards `current_body_` to the renderer. A request is not teed in two of those places. Redirects forward `OnReceiveRedirect` and emit `phase: "redirect"` with no body.
 
-The tee reads the network consumer only when the renderer producer accepts bytes. One 16 KiB pending chunk is the only userspace forwarding buffer. Capture stops at `maxBytesPerResponse` and at the aggregate cap, sets `truncated` or `skipReason`, and keeps forwarding. Creating the pipe, filling the in-flight set, or filling the aggregate does not fail the request. Unsubscribe and session close bump the generation, drop the capture buffer, and leave the forward running.
+The tee reads the network consumer only when the renderer producer accepts bytes. One 16 KiB pending chunk is the only userspace forwarding buffer. Capture stops at `maxBytesPerResponse` and at the aggregate cap, sets `truncated` or `skipReason`, and keeps forwarding. Creating the pipe, filling the in-flight set, or filling the aggregate does not fail the request. The UI queue holds at most 64 events. A discarded event releases its bytes immediately, and the next delivered event reports the count in `queueDropped`. Installing or replacing the listener bumps the generation, so a tee from the previous subscription does not deliver into the new one. `updateResponseBodyObservationLimits` does not bump it. Clearing observation, including session close, bumps the generation, drops queued payloads, and leaves a tee that already started forwarding the page body on that path.
+
+Delivery runs on the UI thread. It does not require an ambient current context. It enters `JavascriptEnvironment::GetIsolate()`, then the function's creation context, with `gin_helper::Locker`, `v8::Isolate::Scope`, `gin_helper::NodeEntryScope`, and `v8::MicrotasksScope`, which is the same shape as `gin_helper::V8FunctionInvoker` and `NodeStreamLoader`. A disposed creation context skips that call. The listener is not invoked off the UI thread.
 
 Chromium 159 `services/network/url_loader.cc` fills the data pipe from `URLRequest::Read`. `URLResponseHead.client_side_content_decoding_types` is non-empty only when the request set client-side content decoding. Ordinary page and `fetch` loads do not, so the observed bytes are the filtered body, including gzip, deflate, and brotli decoded by the network stack. `networkDecoded` reports that field. The tee does not decode or re-encode.
 
 Not observed, and not claimed:
 
-*   `file:`, custom protocols, and WebSocket. WebSocket stays the next checkpoint. `ProxyingWebSocket` still drops the connection endpoints after connect.
+*   `file:` and custom protocols. WebSocket messages use the separate socket path below.
 *   The extensions early return in `ElectronBrowserClient::WillCreateURLLoaderFactory` when the extensions WebRequest API proxies the factory, Electron has no webRequest listener, and there is no protocol intercept handler. That path returns before Electron's gate and proxy.
 *   CORS preflight `InProgressRequest` objects.
 
 The listener is intentionally given the body. Nothing in this path writes the body, cookies, or authorization headers to a log or to disk.
+
+## WebSocket messages
+
+`session.observeWebSockets()` validates the filter and limits, then installs one native listener. Extra JavaScript listeners share it through `updateWebSocketMessageObservationLimits`. With no listener, `WillInterceptWebSocket` stays on its previous answer, so a page with no webRequest listener is not proxied just to observe messages.
+
+Chromium 159 `WebSocketConnectorImpl::Connect` calls `WillInterceptWebSocket(frame)`. A dedicated worker's connector carries the creator document's frame, so it uses this path. Shared workers and service workers pass a null frame (`frame_routing_id` is `kRoutingIdNone`) and are not intercepted. `net.WebSocket` calls `NetworkContext::CreateWebSocket` directly and is not intercepted. When extensions `ProxyWebSocket` runs, that hop replaces Electron's proxy and those messages are not observed. Turning observation on skips that extension return so the Electron forwarder exists; that is source-level and unrun.
+
+After the handshake, `ProxyingWebSocket` no longer drops the Mojo endpoints when the connection is claimed. `WebSocketMessageForwarder` binds both `WebSocket` and `WebSocketClient` and tees both data pipes. `OnDataFrame` is forwarded before the corresponding bytes are copied, matching `services/network/websocket.cc`, which sends the frame message and then writes the pipe. The renderer writes `SendMessage` and then the bytes, matching `websocket_channel_impl.cc`. The forwarder reads a pipe only up to the length those messages announced, and only when the other side's pipe accepts the write. Ping and pong never appear on `WebSocketClient`; they are answered inside `net::WebSocketChannel` and this API does not invent them.
+
+Incoming fragmentation follows `fin` and `WebSocketMessageType`. A message is emitted when the final frame's bytes have been forwarded. Outgoing `SendMessage` is one message, `TEXT` or `BINARY`. `text` is set only when that complete message is valid UTF-8. Truncation keeps forwarding the rest of the message. Closing mid-message emits the partial bytes with `truncated` and then `closed` or `failed`. Replacing the listener bumps the generation. Clearing it does too, and an in-progress forwarder keeps copying pipes after it stops emitting.
+
+`wireCompressed` is true when the handshake extensions contain `permessage-deflate`. `WebSocketDeflateStream` inflates before `WebSocketChannel::HandleDataFrame`, and the renderer writes uncompressed bytes that the network service deflates on send. The observed payload is therefore the logical message. That reading is from the pinned sources above. It is not runtime-proven.
 
 ## Explicitly not implemented
 
 The following stay out of this checkpoint.
 
 *   Native persona application, including user agent and Client Hints, locale, timezone, hardware concurrency, device memory, screen, WebGL, WebGPU identity, canvas, audio, fonts, and WebRTC IP policy.
-*   WebSocket message body capture.
 *   Any claim that a persona is undetectable, or that codecs and Widevine are something other than what this build actually contains.
-*   A compiled or runtime-executed proof of the accessibility snapshot or the response-body tee. Both are source implementations.
+*   A compiled or runtime-executed proof of the accessibility snapshot, the response-body tee, or the WebSocket forwarder. All three are source implementations.
 
 `build/args/all.gn` already sets proprietary codecs, Chrome ffmpeg branding, and Widevine flags. Those flags are unchanged here. A CDM is present only when its file exists. This checkpoint does not pretend otherwise.
 
 ## Verification gates
 
-Pure logic is covered by `spec/agent-runtime-logic.test.ts`. It imports the production module, including response-limit validation and delivery, and can run without an Electron binary:
+Pure logic is covered by `spec/agent-runtime-logic.test.ts`. It imports the production module, including response and WebSocket limit validation and per-listener delivery, and can run without an Electron binary:
 
 ```bash
 node --experimental-strip-types --test spec/agent-runtime-logic.test.ts
@@ -143,11 +156,11 @@ node node_modules/typescript/bin/tsc -p tsconfig.agent-runtime-logic.json --pret
 
 The second command typechecks that test together with `lib/browser/api/agent-runtime-logic.ts`. It does not use `verbatimModuleSyntax`, and it is not part of `tsconfig.script.json`. Putting the test under `script/` made `tsc -p tsconfig.script.json` parse the CommonJS logic module with `verbatimModuleSyntax`. The test now lives under `spec/`.
 
-`spec/api-agent-runtime.spec.ts` and `spec/fixtures/agent-runtime/` exercise the registered API inside Electron: partition isolation, adoption, HTTP 201 and 404, non-HTTP status, cancellation, input, accessibility snapshots, and response bodies with and without a webRequest listener. Those specs were not executed in this checkpoint. They must not be described as passed until `e test` runs them. The C++ bindings were not compiled. A focused native test binary is also pending for the same reason.
+`spec/api-agent-runtime.spec.ts` and `spec/fixtures/agent-runtime/` exercise the registered API inside Electron. The new cases cover an asynchronous response body, unsubscribe and session close, and a local WebSocket server for text, binary, empty, and fragmented messages, both directions, truncation, an in-flight skip, session isolation, unsubscribe, a webRequest listener, handshake failure, and a dropped socket. permessage-deflate is not produced by that fixture. Those specs were not executed in this checkpoint. They must not be described as passed until `e test` runs them. The C++ bindings were not compiled. A focused native test binary is also pending for the same reason.
 
 Not run for this checkpoint, and not claimed:
 
-*   `e sync`, `gclient`, or a Chromium checkout beyond the pinned public sources read for `RequestAXTreeSnapshot` and `services/network/url_loader.cc`
+*   `e sync`, `gclient`, or a Chromium checkout. The WebSocket contracts were read from the public Chromium `159.0.8140.0` sources for `websocket.mojom`, `services/network/websocket.cc`, `net/websockets/websocket_channel.cc`, `net/websockets/websocket_deflate_stream.h`, `content/browser/websockets/websocket_connector_impl.cc`, and Blink `websocket_channel_impl.cc`. That reading is not a runtime proof.
 *   `e build` or any full Electron build
 *   `e test` or vitest under Electron
 *   `script/gen-filenames.mts`. Running it here would drop `node_header_sources`, because `../third_party/electron_node` and `../v8` are not checked out. The new structure doc was inserted into `filenames.auto.gni` in sorted order by hand. The new C++ files are listed in `filenames.gni`.
@@ -156,14 +169,14 @@ Not run for this checkpoint, and not claimed:
 
 This checkpoint ran:
 
-*   `node --experimental-strip-types --test spec/agent-runtime-logic.test.ts` — exit 0, 20 passed, 0 failed. This executes the production logic module, including response validation and delivery. It is not an Electron runtime test. Node prints `MODULE_TYPELESS_PACKAGE_JSON` because the logic file is TypeScript inside a package with no `"type"` field. That warning is left in place.
+*   `node --experimental-strip-types --test spec/agent-runtime-logic.test.ts` — exit 0, 21 passed, 0 failed. This executes the production logic module, including response and WebSocket validation and delivery. It does not execute the C++ frame reassembly. Node prints `MODULE_TYPELESS_PACKAGE_JSON` because the logic file is TypeScript inside a package with no `"type"` field. That warning is left in place.
 *   `node node_modules/typescript/bin/tsc -p tsconfig.agent-runtime-logic.json --pretty false --noEmit` — exit 0. This project includes only the logic test and `lib/browser/api/agent-runtime-logic.ts`. It sets `types: ["node"]` so TypeScript 7 loads the real `@types/node`. It does not set `verbatimModuleSyntax`.
-*   `node node_modules/typescript/bin/tsc -p tsconfig.script.json --pretty false --noEmit` — exit 1. The output contains no `agent-runtime` path and no `TS1287`. The remaining errors are pre-existing `script/` files that need `@types/node` and packages such as `@electron/get` and `@octokit/rest`, which this environment does not install into the script project.
-*   `node --experimental-strip-types --check` on the logic module, the runtime module, and the spec — exit 0. That is syntax only.
-*   `node script/create-api-json.mjs` and `node node_modules/@electron/typescript-definitions/dist/bin.js --api=electron-api.json` — exit 0. `observeResponses`, `setResponseBodyObservation`, and `ResponseBodyObservation` are in the generated JSON and `electron.d.ts`. Those generated files are gitignored.
-*   `node spec/ts-smoke/runner.js` — exit 0. The fixture imports `agentRuntime`, calls `createSession`, `observeResponses`, `setResponseBodyObservation`, `captureAccessibilitySnapshot`, and `snapshot`, and keeps `@ts-expect-error` on a string byte limit, a missing listener, and a missing partition.
+*   `node node_modules/typescript/bin/tsc -p tsconfig.script.json --pretty false --noEmit` — exit 1, 190 errors. The output contains no `agent-runtime` path and no `TS1287`. The errors are pre-existing `script/` files that need `@types/node` and packages such as `@electron/get` and `@octokit/rest`.
+*   `node --experimental-strip-types --check` on the logic module, the runtime module, the logic test, and `spec/api-agent-runtime.spec.ts` — exit 0. That is syntax only.
+*   `node script/create-api-json.mjs` — exit 0. `node node_modules/@electron/typescript-definitions/dist/bin.js --api=electron-api.json` — exit 0. `observeWebSockets`, `setWebSocketMessageObservation`, `updateResponseBodyObservationLimits`, and `WebSocketMessageObservation` are in the generated JSON and `electron.d.ts`. Those generated files are gitignored.
+*   `node spec/ts-smoke/runner.js` — exit 0. The fixture calls `observeResponses`, `observeWebSockets`, `setResponseBodyObservation`, `setWebSocketMessageObservation`, both limit updates, `captureAccessibilitySnapshot`, and `snapshot`, and keeps `@ts-expect-error` on string limits, missing listeners, and a missing partition.
 *   `node node_modules/typescript/bin/tsc -p tsconfig.electron.json --pretty false --noEmit` — exit 1, ten errors, all missing `@node/...` because `../third_party/electron_node` is not checked out. No error names an agent runtime file.
-*   `node node_modules/typescript/bin/tsc -p tsconfig.spec.json --pretty false --noEmit` — exit 1. No error names an agent runtime file. The errors are missing spec dependencies (`protobufjs`, `busboy`, `ws`, `send`, and others) that a full install would provide. The typecheck used real `vitest@5.1.0` and real `@types/node@22.19.1`. A temporary vitest declaration stub from the previous checkpoint was deleted and is not a result of this run.
-*   `node node_modules/@electron/lint-roller/dist/bin/lint-markdown-api-history.js` with the repo's history arguments — exit 0, 131 blocks, 0 errors. One pre-existing warning in `crash-reporter.md`.
+*   `node node_modules/typescript/bin/tsc -p tsconfig.spec.json --pretty false --noEmit` — exit 1, 35 errors. No error names an agent runtime file. The errors are pre-existing missing spec dependencies (`protobufjs`, `busboy`, `ws`, `send`, and others). The typecheck used the installed `vitest` and `@types/node`. No stub module declarations were added.
+*   `node node_modules/@electron/lint-roller/dist/bin/lint-markdown-api-history.js` with the repo's history arguments — exit 0, 133 blocks, 0 errors. One pre-existing warning in `crash-reporter.md`.
 
-oxlint is not installed in this environment. `e build` and `e test` were not run. The C++ response-body tee and the accessibility snapshot binding are source only. `spec/api-agent-runtime.spec.ts` was not executed.
+oxlint is not installed in this environment. clang-format is not installed. `e build` and `e test` were not run. The C++ response-body tee, the WebSocket forwarder, and the accessibility snapshot binding are source only. `spec/api-agent-runtime.spec.ts` was not executed.

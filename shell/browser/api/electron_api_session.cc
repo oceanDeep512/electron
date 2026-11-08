@@ -81,6 +81,7 @@
 #include "shell/browser/media/media_device_id_salt.h"
 #include "shell/browser/net/cert_verifier_client.h"
 #include "shell/browser/net/response_body_observer.h"
+#include "shell/browser/net/websocket_message_observer.h"
 #include "shell/browser/net/url_loader_factory_gate.h"
 #include "shell/browser/net/resolve_host_function.h"
 #include "shell/browser/net/resolve_proxy_helper.h"
@@ -626,8 +627,10 @@ Session::Session(v8::Isolate* isolate, ElectronBrowserContext* browser_context)
 }
 
 Session::~Session() {
-  if (browser_context_ && browser_context_->intercept_state())
+  if (browser_context_ && browser_context_->intercept_state()) {
     browser_context_->intercept_state()->ClearResponseBodyObservation();
+    browser_context_->intercept_state()->ClearWebSocketObservation();
+  }
   Dispose();
 }
 
@@ -1032,6 +1035,209 @@ void Session::SetResponseBodyObservation(v8::Local<v8::Value> listener,
   ConfigureResponseBodyObservation(state, args->isolate(),
                                   listener.As<v8::Function>(),
                                   std::move(limits));
+}
+
+void Session::UpdateResponseBodyObservationLimits(gin::Arguments* args) {
+  if (!browser_context_ || !browser_context_->intercept_state()) {
+    args->ThrowTypeError("The session has been destroyed");
+    return;
+  }
+  InterceptState* state = browser_context_->intercept_state();
+  if (!state->response_body_enabled()) {
+    args->ThrowTypeError("Response observation is not enabled");
+    return;
+  }
+  ResponseBodyLimits limits;
+  v8::Local<v8::Value> options;
+  if (!args->GetNext(&options) || !options->IsObject()) {
+    args->ThrowTypeError("Response observation options must be an object");
+    return;
+  }
+  gin_helper::Dictionary dict(args->isolate(), options.As<v8::Object>());
+  if (dict.Has("urls")) {
+    std::vector<std::string> urls;
+    if (!dict.Get("urls", &urls) || urls.size() > 32) {
+      args->ThrowTypeError("urls must be an array of at most 32 strings");
+      return;
+    }
+    for (const std::string& pattern : urls) {
+      if (!IsValidResponseBodyPattern(pattern)) {
+        args->ThrowTypeError(
+            "A url pattern must be 1 to 2048 characters and contain at most "
+            "one *");
+        return;
+      }
+    }
+    limits.patterns = std::move(urls);
+  }
+  if (dict.Has("maxBytesPerResponse")) {
+    int value = 0;
+    if (!dict.Get("maxBytesPerResponse", &value) || value < 1 ||
+        static_cast<size_t>(value) > kResponseBodyMaxBytes) {
+      args->ThrowTypeError(
+          "maxBytesPerResponse must be an integer from 1 to 10000000");
+      return;
+    }
+    limits.max_bytes_per_response = static_cast<size_t>(value);
+  }
+  if (dict.Has("maxInFlight")) {
+    int value = 0;
+    if (!dict.Get("maxInFlight", &value) || value < 1 ||
+        value > kResponseBodyMaxInFlight) {
+      args->ThrowTypeError("maxInFlight must be an integer from 1 to 64");
+      return;
+    }
+    limits.max_in_flight = value;
+  }
+  if (dict.Has("maxAggregateBytes")) {
+    int value = 0;
+    if (!dict.Get("maxAggregateBytes", &value) || value < 1 ||
+        static_cast<size_t>(value) > kResponseBodyMaxAggregateBytes) {
+      args->ThrowTypeError(
+          "maxAggregateBytes must be an integer from 1 to 64000000");
+      return;
+    }
+    limits.max_aggregate_bytes = static_cast<size_t>(value);
+  }
+  state->UpdateResponseBodyLimits(std::move(limits));
+}
+
+void Session::SetWebSocketMessageObservation(v8::Local<v8::Value> listener,
+                                             gin::Arguments* args) {
+  if (!browser_context_ || !browser_context_->intercept_state()) {
+    args->ThrowTypeError("The session has been destroyed");
+    return;
+  }
+  InterceptState* state = browser_context_->intercept_state();
+  if (listener->IsNull() || listener->IsUndefined()) {
+    state->ClearWebSocketObservation();
+    return;
+  }
+  if (!listener->IsFunction()) {
+    args->ThrowTypeError("Must pass null or a function");
+    return;
+  }
+  WebSocketLimits limits;
+  v8::Local<v8::Value> options;
+  if (args->GetNext(&options) && !options->IsNullOrUndefined()) {
+    if (!options->IsObject()) {
+      args->ThrowTypeError("WebSocket observation options must be an object");
+      return;
+    }
+    gin_helper::Dictionary dict(args->isolate(), options.As<v8::Object>());
+    if (dict.Has("urls")) {
+      std::vector<std::string> urls;
+      if (!dict.Get("urls", &urls) || urls.size() > 32) {
+        args->ThrowTypeError("urls must be an array of at most 32 strings");
+        return;
+      }
+      for (const std::string& pattern : urls) {
+        if (!IsValidWebSocketPattern(pattern)) {
+          args->ThrowTypeError(
+              "A url pattern must be 1 to 2048 characters and contain at most "
+              "one *");
+          return;
+        }
+      }
+      limits.patterns = std::move(urls);
+    }
+    if (dict.Has("maxBytesPerMessage")) {
+      int value = 0;
+      if (!dict.Get("maxBytesPerMessage", &value) || value < 1 ||
+          static_cast<size_t>(value) > kWebSocketMaxBytes) {
+        args->ThrowTypeError(
+            "maxBytesPerMessage must be an integer from 1 to 10000000");
+        return;
+      }
+      limits.max_bytes_per_message = static_cast<size_t>(value);
+    }
+    if (dict.Has("maxInFlight")) {
+      int value = 0;
+      if (!dict.Get("maxInFlight", &value) || value < 1 ||
+          value > kWebSocketMaxInFlight) {
+        args->ThrowTypeError("maxInFlight must be an integer from 1 to 64");
+        return;
+      }
+      limits.max_in_flight = value;
+    }
+    if (dict.Has("maxAggregateBytes")) {
+      int value = 0;
+      if (!dict.Get("maxAggregateBytes", &value) || value < 1 ||
+          static_cast<size_t>(value) > kWebSocketMaxAggregateBytes) {
+        args->ThrowTypeError(
+            "maxAggregateBytes must be an integer from 1 to 64000000");
+        return;
+      }
+      limits.max_aggregate_bytes = static_cast<size_t>(value);
+    }
+  }
+  ConfigureWebSocketObservation(state, args->isolate(),
+                                listener.As<v8::Function>(), std::move(limits));
+}
+
+void Session::UpdateWebSocketMessageObservationLimits(gin::Arguments* args) {
+  if (!browser_context_ || !browser_context_->intercept_state()) {
+    args->ThrowTypeError("The session has been destroyed");
+    return;
+  }
+  InterceptState* state = browser_context_->intercept_state();
+  if (!state->websocket_enabled()) {
+    args->ThrowTypeError("WebSocket observation is not enabled");
+    return;
+  }
+  WebSocketLimits limits;
+  v8::Local<v8::Value> options;
+  if (!args->GetNext(&options) || !options->IsObject()) {
+    args->ThrowTypeError("WebSocket observation options must be an object");
+    return;
+  }
+  gin_helper::Dictionary dict(args->isolate(), options.As<v8::Object>());
+  if (dict.Has("urls")) {
+    std::vector<std::string> urls;
+    if (!dict.Get("urls", &urls) || urls.size() > 32) {
+      args->ThrowTypeError("urls must be an array of at most 32 strings");
+      return;
+    }
+    for (const std::string& pattern : urls) {
+      if (!IsValidWebSocketPattern(pattern)) {
+        args->ThrowTypeError(
+            "A url pattern must be 1 to 2048 characters and contain at most "
+            "one *");
+        return;
+      }
+    }
+    limits.patterns = std::move(urls);
+  }
+  if (dict.Has("maxBytesPerMessage")) {
+    int value = 0;
+    if (!dict.Get("maxBytesPerMessage", &value) || value < 1 ||
+        static_cast<size_t>(value) > kWebSocketMaxBytes) {
+      args->ThrowTypeError(
+          "maxBytesPerMessage must be an integer from 1 to 10000000");
+      return;
+    }
+    limits.max_bytes_per_message = static_cast<size_t>(value);
+  }
+  if (dict.Has("maxInFlight")) {
+    int value = 0;
+    if (!dict.Get("maxInFlight", &value) || value < 1 ||
+        value > kWebSocketMaxInFlight) {
+      args->ThrowTypeError("maxInFlight must be an integer from 1 to 64");
+      return;
+    }
+    limits.max_in_flight = value;
+  }
+  if (dict.Has("maxAggregateBytes")) {
+    int value = 0;
+    if (!dict.Get("maxAggregateBytes", &value) || value < 1 ||
+        static_cast<size_t>(value) > kWebSocketMaxAggregateBytes) {
+      args->ThrowTypeError(
+          "maxAggregateBytes must be an integer from 1 to 64000000");
+      return;
+    }
+    limits.max_aggregate_bytes = static_cast<size_t>(value);
+  }
+  UpdateWebSocketObservationLimits(state, std::move(limits));
 }
 
 void Session::SetPermissionCheckHandler(v8::Local<v8::Value> val,
@@ -1968,6 +2174,12 @@ void Session::FillObjectTemplate(v8::Isolate* isolate,
           "setPermissionCheckHandler")
       .SetMethod<&Session::SetResponseBodyObservation>(
           "setResponseBodyObservation")
+      .SetMethod<&Session::UpdateResponseBodyObservationLimits>(
+          "updateResponseBodyObservationLimits")
+      .SetMethod<&Session::SetWebSocketMessageObservation>(
+          "setWebSocketMessageObservation")
+      .SetMethod<&Session::UpdateWebSocketMessageObservationLimits>(
+          "updateWebSocketMessageObservationLimits")
       .SetMethod<&Session::SetDisplayMediaRequestHandler>(
           "setDisplayMediaRequestHandler")
       .SetMethod<&Session::SetDevicePermissionHandler>(

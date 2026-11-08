@@ -439,6 +439,11 @@ ElectronBrowserContext::ElectronBrowserContext(
 ElectronBrowserContext::~ElectronBrowserContext() {
   DCHECK_CURRENTLY_ON(BrowserThread::UI);
 
+  if (intercept_state_) {
+    intercept_state_->ClearResponseBodyObservation();
+    intercept_state_->ClearWebSocketObservation();
+  }
+
   NotifyWillBeDestroyed();
 
   // Notify any keyed services of browser context destruction.

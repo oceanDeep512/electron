@@ -20,6 +20,10 @@
 #include "base/task/sequenced_task_runner.h"
 #include "content/public/browser/browser_task_traits.h"
 #include "content/public/browser/browser_thread.h"
+#include "shell/browser/javascript_environment.h"
+#include "shell/browser/net/websocket_message_observer.h"
+#include "shell/common/gin_helper/locker.h"
+#include "shell/common/gin_helper/node_entry_scope.h"
 #include "mojo/public/cpp/base/big_buffer.h"
 #include "mojo/public/cpp/bindings/receiver.h"
 #include "mojo/public/cpp/bindings/remote.h"
@@ -37,6 +41,7 @@
 #include "shell/browser/net/url_loader_factory_gate.h"
 #include "shell/common/node_util.h"
 #include "url/gurl.h"
+#include "v8/include/v8-microtask-queue.h"
 #include "v8/include/v8.h"
 
 namespace electron {
@@ -387,16 +392,24 @@ class ResponseBodyListener {
       : isolate_(isolate), function_(isolate, function) {}
 
   void Deliver(const ResponseBodyEvent& event) {
-    v8::Isolate* isolate = isolate_;
-    if (!isolate || isolate != v8::Isolate::TryGetCurrent() ||
-        function_.IsEmpty()) {
+    // Mojo completion is posted onto the UI thread. JavascriptEnvironment
+    // enters the isolate at startup, but this callback is not a Node entry,
+    // and GetCurrentContext() can be empty. Enter the isolate and the
+    // function's own creation context instead of dropping the event.
+    v8::Isolate* isolate = JavascriptEnvironment::GetIsolate();
+    if (!isolate || function_.IsEmpty())
       return;
-    }
+    gin_helper::Locker locker(isolate);
+    v8::Isolate::Scope isolate_scope(isolate);
     v8::HandleScope handle_scope(isolate);
-    v8::Local<v8::Context> context = isolate->GetCurrentContext();
-    if (context.IsEmpty())
+    v8::Local<v8::Function> function = function_.Get(isolate);
+    v8::Local<v8::Context> context;
+    if (!function->GetCreationContext().ToLocal(&context))
       return;
     v8::Context::Scope context_scope(context);
+    gin_helper::NodeEntryScope node_scope(context, function);
+    v8::MicrotasksScope microtasks_scope(
+        context, v8::MicrotasksScope::kRunMicrotasks);
     v8::Local<v8::Object> object = v8::Object::New(isolate);
     if (!SetProp(isolate, context, object, "phase", Utf8(isolate, event.phase)) ||
         !SetProp(isolate, context, object, "requestId",
@@ -415,7 +428,9 @@ class ResponseBodyListener {
         !SetProp(isolate, context, object, "skipReason",
                  Utf8(isolate, event.skip_reason)) ||
         !SetProp(isolate, context, object, "errorCode",
-                 v8::Integer::New(isolate, event.error_code))) {
+                 v8::Integer::New(isolate, event.error_code)) ||
+        !SetProp(isolate, context, object, "queueDropped",
+                 v8::Integer::New(isolate, event.queue_dropped))) {
       return;
     }
     v8::Local<v8::Value> body = v8::Null(isolate);
@@ -432,8 +447,7 @@ class ResponseBodyListener {
     v8::TryCatch try_catch(isolate);
     // The exception can quote caller code. Do not read or log it: the event
     // itself may hold a response body.
-    (void)function_.Get(isolate)->Call(context, v8::Undefined(isolate), 1,
-                                       &arg);
+    (void)function->Call(context, v8::Undefined(isolate), 1, &arg);
   }
 
  private:
@@ -462,10 +476,9 @@ void ConfigureResponseBodyObservation(InterceptState* state,
 }
 
 InterceptState::~InterceptState() {
-  if (!response_body_listener_)
-    return;
-  CHECK(content::BrowserThread::CurrentlyOn(content::BrowserThread::UI));
-  response_body_listener_.reset();
+  // v8::Global must already have been reset on the UI thread. The last ref
+  // can drop on the IO thread while a tee finishes forwarding.
+  CHECK(!response_body_listener_);
 }
 
 void InterceptState::InstallResponseBodyListener(
@@ -483,9 +496,25 @@ void InterceptState::InstallResponseBodyListener(
     base::AutoLock lock(lock_);
     response_limits_ = std::move(limits);
     response_enabled_ = true;
+    ++response_generation_;
   }
   response_body_listener_ = std::move(listener);
   response_body_enabled_.store(true, std::memory_order_release);
+}
+
+void InterceptState::UpdateResponseBodyLimits(ResponseBodyLimits limits) {
+  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+  limits.max_bytes_per_response =
+      ClampBytes(limits.max_bytes_per_response, kResponseBodyDefaultMaxBytes,
+                 kResponseBodyMaxBytes);
+  limits.max_in_flight = ClampInFlight(limits.max_in_flight);
+  limits.max_aggregate_bytes = ClampBytes(limits.max_aggregate_bytes,
+                                          kResponseBodyDefaultAggregateBytes,
+                                          kResponseBodyMaxAggregateBytes);
+  base::AutoLock lock(lock_);
+  if (!response_enabled_)
+    return;
+  response_limits_ = std::move(limits);
 }
 
 void InterceptState::ClearResponseBodyObservation() {
@@ -496,6 +525,19 @@ void InterceptState::ClearResponseBodyObservation() {
     response_enabled_ = false;
     ++response_generation_;
     response_limits_ = ResponseBodyLimits();
+    while (!response_queue_.empty()) {
+      ResponseBodyEvent dropped = std::move(response_queue_.front());
+      response_queue_.pop_front();
+      if (dropped.buffered) {
+        if (dropped.buffered > response_aggregate_)
+          response_aggregate_ = 0;
+        else
+          response_aggregate_ -= dropped.buffered;
+      }
+    }
+    response_queued_bytes_ = 0;
+    response_queue_dropped_ = 0;
+    response_queue_scheduled_ = false;
   }
   response_body_listener_.reset();
 }
@@ -571,26 +613,96 @@ bool InterceptState::ResponseBodyGenerationCurrent(uint64_t generation) const {
 }
 
 void InterceptState::EmitResponseBody(ResponseBodyEvent event) {
-  content::GetUIThreadTaskRunner({})->PostTask(
-      FROM_HERE, base::BindOnce(&InterceptState::DeliverResponseBody,
-                                scoped_refptr<InterceptState>(this),
-                                std::move(event)));
-}
-
-void InterceptState::DeliverResponseBody(ResponseBodyEvent event) {
-  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
-  if (event.buffered)
-    ReleaseResponseBodyBytes(event.buffered);
-  if (!response_body_listener_)
-    return;
-  bool current = false;
+  bool schedule = false;
   {
     base::AutoLock lock(lock_);
-    current = response_enabled_ && event.generation == response_generation_;
+    while (response_queue_.size() >= kResponseBodyMaxQueuedEvents) {
+      ResponseBodyEvent dropped = std::move(response_queue_.front());
+      response_queue_.pop_front();
+      if (dropped.buffered) {
+        if (dropped.buffered > response_aggregate_)
+          response_aggregate_ = 0;
+        else
+          response_aggregate_ -= dropped.buffered;
+        if (dropped.buffered > response_queued_bytes_)
+          response_queued_bytes_ = 0;
+        else
+          response_queued_bytes_ -= dropped.buffered;
+      }
+      ++response_queue_dropped_;
+    }
+    if (event.buffered)
+      response_queued_bytes_ += event.buffered;
+    response_queue_.push_back(std::move(event));
+    if (!response_queue_scheduled_) {
+      response_queue_scheduled_ = true;
+      schedule = true;
+    }
   }
-  if (!current)
+  if (!schedule)
     return;
-  response_body_listener_->Deliver(event);
+  content::GetUIThreadTaskRunner({})->PostTask(
+      FROM_HERE, base::BindOnce(&InterceptState::DrainResponseBodyQueue,
+                                scoped_refptr<InterceptState>(this)));
+}
+
+void InterceptState::DrainResponseBodyQueue() {
+  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+  // A handful per task so one burst cannot stall the UI thread. The queue
+  // itself stays capped.
+  constexpr int kPerTask = 8;
+  for (int delivered = 0; delivered < kPerTask; ++delivered) {
+    ResponseBodyEvent event;
+    bool have = false;
+    {
+      base::AutoLock lock(lock_);
+      if (response_queue_.empty()) {
+        response_queue_scheduled_ = false;
+        return;
+      }
+      event = std::move(response_queue_.front());
+      response_queue_.pop_front();
+      if (event.buffered) {
+        if (event.buffered > response_queued_bytes_)
+          response_queued_bytes_ = 0;
+        else
+          response_queued_bytes_ -= event.buffered;
+        if (event.buffered > response_aggregate_)
+          response_aggregate_ = 0;
+        else
+          response_aggregate_ -= event.buffered;
+        event.buffered = 0;
+      }
+      if (response_queue_dropped_ > 0) {
+        event.queue_dropped += response_queue_dropped_;
+        response_queue_dropped_ = 0;
+      }
+      have = true;
+    }
+    if (!have)
+      return;
+    if (!response_body_listener_)
+      continue;
+    bool current = false;
+    {
+      base::AutoLock lock(lock_);
+      current = response_enabled_ && event.generation == response_generation_;
+    }
+    if (!current)
+      continue;
+    response_body_listener_->Deliver(event);
+  }
+  bool more = false;
+  {
+    base::AutoLock lock(lock_);
+    more = !response_queue_.empty();
+    response_queue_scheduled_ = more;
+  }
+  if (more) {
+    content::GetUIThreadTaskRunner({})->PostTask(
+        FROM_HERE, base::BindOnce(&InterceptState::DrainResponseBodyQueue,
+                                  scoped_refptr<InterceptState>(this)));
+  }
 }
 
 class ResponseBodyFollow::State {

@@ -992,7 +992,51 @@ added:
 
 One listener per `Session`. A second call replaces it. `agentRuntime` session `observeResponses()` is the supported way to subscribe more than once; it fans one native listener out in JavaScript.
 
-The listener is given response bytes on purpose. Electron does not redact the body and does not persist it. No listener means the direct renderer-to-network path is left unchanged. A full buffer, a full in-flight set, or a failure to create the tee pipe skips that capture and does not fail the request. Redirects carry no body.
+The listener is given response bytes on purpose. Electron does not redact the body and does not persist it. No listener means the direct renderer-to-network path is left unchanged. A full buffer, a full in-flight set, a full UI queue, or a failure to create the tee pipe skips that capture and does not fail the request. Redirects carry no body. Replacing the listener drops events from the previous subscription. `updateResponseBodyObservationLimits` changes the ceiling without that drop.
+
+This is not a capture of every request. Extensions that return before Electron's loader proxy, CORS preflights, and non-HTTP schemes are not observed.
+
+#### `ses.updateResponseBodyObservationLimits(options)`
+
+* `options` Object
+  * `urls` string[] (optional)
+  * `maxBytesPerResponse` Integer (optional)
+  * `maxInFlight` Integer (optional)
+  * `maxAggregateBytes` Integer (optional)
+
+Adjusts the ceiling of the listener already installed by `setResponseBodyObservation`. It does not replace that listener and does not bump the subscription generation. Throws if observation is not enabled.
+
+#### `ses.setWebSocketMessageObservation(listener[, options])`
+
+<!--
+```YAML history
+added:
+  - pr-url: https://github.com/oceanDeep512/electron/pull/1
+    description: "Added a session-scoped WebSocket message listener."
+```
+-->
+
+* `listener` Function | null - Receives one [WebSocketMessageObservation](structures/websocket-message-observation.md). Pass `null` to remove the listener.
+  * `event` [WebSocketMessageObservation](structures/websocket-message-observation.md)
+* `options` Object (optional)
+  * `urls` string[] (optional) - Full-URL prefixes, or one `*` glob. Empty observes every `ws` and `wss` URL.
+  * `maxBytesPerMessage` Integer (optional) - Default `1000000`, maximum `10000000`.
+  * `maxInFlight` Integer (optional) - Default `8`, maximum `64`.
+  * `maxAggregateBytes` Integer (optional) - Default `8000000`, maximum `64000000`.
+
+One listener per `Session`. A second call replaces it and drops events from the previous subscription. `agentRuntime` session `observeWebSockets()` fans one native listener out in JavaScript and uses `updateWebSocketMessageObservationLimits` when another subscriber is added.
+
+No listener leaves page sockets on the existing handshake path. The listener is given message bytes on purpose. Electron does not redact them and does not persist them. Shared workers, service workers, `net.WebSocket`, and extension websocket proxies are not observed.
+
+#### `ses.updateWebSocketMessageObservationLimits(options)`
+
+* `options` Object
+  * `urls` string[] (optional)
+  * `maxBytesPerMessage` Integer (optional)
+  * `maxInFlight` Integer (optional)
+  * `maxAggregateBytes` Integer (optional)
+
+Adjusts the ceiling of the listener already installed by `setWebSocketMessageObservation`. Throws if observation is not enabled.
 
 #### `ses.disableNetworkEmulation()`
 

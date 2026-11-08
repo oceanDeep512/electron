@@ -19,7 +19,7 @@ export const checkpoint = Object.freeze({
   // WebSocket message bodies are not.
   accessibilitySnapshot: true,
   responseBodyObservation: true,
-  webSocketMessageObservation: false
+  webSocketMessageObservation: true
 } as const);
 
 export type AgentErrorCode =
@@ -50,6 +50,7 @@ export type AgentErrorCode =
   | 'invalid-snapshot'
   | 'snapshot-failed'
   | 'invalid-response-observation'
+  | 'invalid-websocket-observation'
   | 'page-script-failed';
 
 export class AgentRuntimeError extends Error {
@@ -1230,8 +1231,9 @@ export interface ResponseObservationEvent {
   mimeType: string;
   networkDecoded: boolean;
   truncated: boolean;
-  skipReason: '' | 'in-flight-limit' | 'aggregate-limit' | 'tee-failed';
+  skipReason: '' | 'in-flight-limit' | 'aggregate-limit' | 'tee-failed' | 'dispatch-queue';
   errorCode: number;
+  queueDropped: number;
   body: Uint8Array | null;
 }
 
@@ -1393,6 +1395,213 @@ export function applyResponseObservation(
     ...event,
     body: copied.body,
     truncated: event.truncated || copied.truncated,
+    skipReason: '',
+    queueDropped: event.queueDropped ?? 0
+  };
+}
+
+// Kept in sync with kWebSocket* in shell/browser/net/websocket_message_observer.h.
+export const WEBSOCKET_DEFAULT_MAX_BYTES = 1_000_000;
+export const WEBSOCKET_MAX_BYTES = 10_000_000;
+export const WEBSOCKET_DEFAULT_MAX_IN_FLIGHT = 8;
+export const WEBSOCKET_MAX_IN_FLIGHT = 64;
+export const WEBSOCKET_DEFAULT_AGGREGATE_BYTES = 8_000_000;
+export const WEBSOCKET_MAX_AGGREGATE_BYTES = 64_000_000;
+
+export interface WebSocketObservationPolicy {
+  urls: string[];
+  maxBytesPerMessage: number;
+  maxInFlight: number;
+  maxAggregateBytes: number;
+}
+
+export interface WebSocketObservationBudget {
+  inFlight: number;
+  openedIds: Set<string>;
+  skippedIds: Set<string>;
+}
+
+export interface WebSocketObservationEvent {
+  connectionId: string;
+  messageId: string;
+  phase: 'opened' | 'message' | 'closed' | 'failed' | 'skipped';
+  url: string;
+  direction: '' | 'received' | 'sent';
+  opcode: '' | 'text' | 'binary' | 'continuation';
+  body: Uint8Array | null;
+  text: string | null;
+  truncated: boolean;
+  skipReason: '' | 'in-flight-limit' | 'aggregate-limit' | 'tee-failed' | 'dispatch-queue';
+  wireCompressed: boolean;
+  wasClean: boolean;
+  code: number;
+  reason: string;
+  errorCode: number;
+  queueDropped: number;
+}
+
+const WEBSOCKET_PHASES = new Set<WebSocketObservationEvent['phase']>([
+  'opened', 'message', 'closed', 'failed', 'skipped'
+]);
+
+function invalidWebSocket(message: string): AgentRuntimeError {
+  return new AgentRuntimeError('invalid-websocket-observation', message);
+}
+
+export function websocketUrlMatches(patterns: readonly string[], url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') return false;
+  if (patterns.length === 0) return true;
+  for (const pattern of patterns) {
+    const star = pattern.indexOf('*');
+    if (star === -1) {
+      if (url.startsWith(pattern)) return true;
+      continue;
+    }
+    const prefix = pattern.slice(0, star);
+    const suffix = pattern.slice(star + 1);
+    if (url.length >= prefix.length + suffix.length && url.startsWith(prefix) && url.endsWith(suffix)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function readWebSocketLimit(
+  value: unknown,
+  name: string,
+  min: number,
+  max: number,
+  fallback: number
+): number {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > max) {
+    throw invalidWebSocket(`${name} must be an integer from ${min} to ${max}`);
+  }
+  return value;
+}
+
+export function normalizeWebSocketObservation(options: unknown): WebSocketObservationPolicy {
+  const record = options === undefined ? {} : options;
+  if (record === null || typeof record !== 'object' || Array.isArray(record)) {
+    throw invalidWebSocket('WebSocket observation options must be an object');
+  }
+  const value = record as {
+    urls?: unknown;
+    maxBytesPerMessage?: unknown;
+    maxInFlight?: unknown;
+    maxAggregateBytes?: unknown;
+  };
+  const urls: string[] = [];
+  if (value.urls !== undefined) {
+    if (!Array.isArray(value.urls) || value.urls.length > 32) {
+      throw invalidWebSocket('urls must be an array of at most 32 strings');
+    }
+    for (const pattern of value.urls) {
+      if (typeof pattern !== 'string' || pattern.length < 1 || pattern.length > 2048 || pattern.split('*').length > 2) {
+        throw invalidWebSocket('A url pattern must be 1 to 2048 characters and contain at most one *');
+      }
+      urls.push(pattern);
+    }
+  }
+  return {
+    urls,
+    maxBytesPerMessage: readWebSocketLimit(value.maxBytesPerMessage, 'maxBytesPerMessage', 1, WEBSOCKET_MAX_BYTES, WEBSOCKET_DEFAULT_MAX_BYTES),
+    maxInFlight: readWebSocketLimit(value.maxInFlight, 'maxInFlight', 1, WEBSOCKET_MAX_IN_FLIGHT, WEBSOCKET_DEFAULT_MAX_IN_FLIGHT),
+    maxAggregateBytes: readWebSocketLimit(value.maxAggregateBytes, 'maxAggregateBytes', 1, WEBSOCKET_MAX_AGGREGATE_BYTES, WEBSOCKET_DEFAULT_AGGREGATE_BYTES)
+  };
+}
+
+export function unionWebSocketObservationPolicies(
+  policies: readonly WebSocketObservationPolicy[]
+): WebSocketObservationPolicy {
+  if (policies.length === 0) return normalizeWebSocketObservation(undefined);
+  if (policies.some((policy) => policy.urls.length === 0)) {
+    return {
+      urls: [],
+      maxBytesPerMessage: Math.max(...policies.map((policy) => policy.maxBytesPerMessage)),
+      maxInFlight: Math.max(...policies.map((policy) => policy.maxInFlight)),
+      maxAggregateBytes: Math.max(...policies.map((policy) => policy.maxAggregateBytes))
+    };
+  }
+  return {
+    urls: [...new Set(policies.flatMap((policy) => policy.urls))],
+    maxBytesPerMessage: Math.max(...policies.map((policy) => policy.maxBytesPerMessage)),
+    maxInFlight: Math.max(...policies.map((policy) => policy.maxInFlight)),
+    maxAggregateBytes: Math.max(...policies.map((policy) => policy.maxAggregateBytes))
+  };
+}
+
+export function createWebSocketObservationBudget(): WebSocketObservationBudget {
+  return { inFlight: 0, openedIds: new Set(), skippedIds: new Set() };
+}
+
+function releaseWebSocket(budget: WebSocketObservationBudget, connectionId: string): void {
+  if (budget.openedIds.delete(connectionId)) budget.inFlight -= 1;
+}
+
+function websocketText(opcode: string, body: Uint8Array | null, truncated: boolean): string | null {
+  if (opcode !== 'text' || truncated || body === null) return null;
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(body);
+  } catch {
+    return null;
+  }
+}
+
+// Production per-listener delivery. Message bytes are copied exactly. Text is
+// set only for a complete, valid UTF-8 text message. Truncation and skips do
+// not describe a dropped socket frame; the native forwarder still copies the
+// bytes to the page.
+export function applyWebSocketObservation(
+  policy: WebSocketObservationPolicy,
+  budget: WebSocketObservationBudget,
+  event: WebSocketObservationEvent
+): WebSocketObservationEvent | null {
+  if (!WEBSOCKET_PHASES.has(event.phase)) return null;
+  if (event.phase !== 'skipped' && !websocketUrlMatches(policy.urls, event.url)) return null;
+  if (event.phase === 'skipped') {
+    budget.skippedIds.delete(event.connectionId);
+    releaseWebSocket(budget, event.connectionId);
+    return { ...event, body: null, text: null, truncated: false };
+  }
+  if (event.phase === 'opened') {
+    if (budget.skippedIds.has(event.connectionId)) return null;
+    if (budget.inFlight >= policy.maxInFlight) {
+      budget.skippedIds.add(event.connectionId);
+      return {
+        ...event,
+        phase: 'skipped',
+        body: null,
+        text: null,
+        truncated: false,
+        skipReason: 'in-flight-limit'
+      };
+    }
+    budget.inFlight += 1;
+    budget.openedIds.add(event.connectionId);
+    return { ...event, body: null, text: null, truncated: false, skipReason: '' };
+  }
+  if (event.phase === 'closed' || event.phase === 'failed') {
+    releaseWebSocket(budget, event.connectionId);
+    return { ...event, body: null, text: null };
+  }
+  if (budget.skippedIds.delete(event.connectionId)) {
+    releaseWebSocket(budget, event.connectionId);
+    return null;
+  }
+  const copied = copyBytes(event.body, Math.min(policy.maxBytesPerMessage, policy.maxAggregateBytes));
+  const truncated = event.truncated || copied.truncated;
+  return {
+    ...event,
+    body: copied.body,
+    text: websocketText(event.opcode, copied.body, truncated),
+    truncated,
     skipReason: ''
   };
 }

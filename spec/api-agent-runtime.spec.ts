@@ -2,8 +2,10 @@ import { agentRuntime, BrowserWindow } from 'electron/main';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import * as crypto from 'node:crypto';
 import * as http from 'node:http';
 import * as path from 'node:path';
+import type { Duplex } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 import * as zlib from 'node:zlib';
 
@@ -690,6 +692,287 @@ describe('agentRuntime response bodies', () => {
       expect(() => runtimeSession.observeResponses({}, () => {})).toThrow();
     } finally {
       await server.close();
+    }
+  });
+
+  it('delivers a completed body after the fetch returns, then stops on unsubscribe and close', async () => {
+    const server = await listen((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('later');
+    });
+    const runtimeSession = createSession();
+    const page = runtimeSession.createPage();
+    const events: Array<{ phase: string; body: Uint8Array | null }> = [];
+    let stop: Function = () => {};
+    const completed = new Promise<Uint8Array>((resolve) => {
+      stop = runtimeSession.observeResponses({}, (event) => {
+        events.push(event);
+        if (event.phase === 'completed' && event.body) resolve(event.body);
+      });
+    });
+    try {
+      expect(await page.webContents.executeJavaScript(
+        `fetch(${JSON.stringify(`${server.origin}/later`)}).then((response) => response.text())`
+      )).toBe('later');
+      expect(Buffer.from(bytesOf(await completed)).toString('utf8')).toBe('later');
+      stop();
+      events.splice(0, events.length);
+      expect(await page.webContents.executeJavaScript(
+        `fetch(${JSON.stringify(`${server.origin}/after-stop`)}).then((response) => response.text())`
+      )).toBe('later');
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(events).toEqual([]);
+      runtimeSession.observeResponses({}, () => {
+        runtimeSession.close();
+      });
+      await page.webContents.executeJavaScript(
+        `fetch(${JSON.stringify(`${server.origin}/closing`)}).then((response) => response.text())`
+      ).catch(() => undefined);
+    } finally {
+      await server.close();
+    }
+  });
+});
+
+function wsAccept(key: string): string {
+  return crypto.createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64');
+}
+
+function wsFrame(opcode: number, payload: Buffer, fin = true): Buffer {
+  const header = Buffer.alloc(payload.length < 126 ? 2 : 4);
+  header[0] = (fin ? 0x80 : 0) | opcode;
+  if (payload.length < 126) {
+    header[1] = payload.length;
+    return Buffer.concat([header, payload]);
+  }
+  header[1] = 126;
+  header.writeUInt16BE(payload.length, 2);
+  return Buffer.concat([header, payload]);
+}
+
+async function listenWebSocket(onOpen: (socket: Duplex) => void): Promise<{ url: string; close: () => Promise<void> }> {
+  const server = http.createServer();
+  server.on('upgrade', (request, socket) => {
+    const key = request.headers['sec-websocket-key'];
+    socket.write(
+      `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${wsAccept(String(key))}\r\n\r\n`
+    );
+    onOpen(socket);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('websocket server has no port');
+  return {
+    url: `ws://127.0.0.1:${address.port}/socket`,
+    close: () => new Promise((resolve) => server.close(() => resolve()))
+  };
+}
+
+function openSocketScript(url: string, replyCount: number): string {
+  return `
+    new Promise((resolve, reject) => {
+      const ws = new WebSocket(${JSON.stringify(url)});
+      const seen = [];
+      ws.onmessage = (event) => {
+        seen.push(typeof event.data === 'string' ? event.data : 'binary');
+        if (seen.length === ${replyCount}) {
+          ws.close();
+          resolve(seen.join(','));
+        }
+      };
+      ws.onerror = () => reject(new Error('socket failed'));
+      ws.onopen = () => ws.send('ping');
+    })
+  `;
+}
+
+describe('agentRuntime websocket messages', () => {
+  // permessage-deflate is not produced by this fixture. The development page
+  // records the pinned-source reading that observed bytes are logical payload.
+
+  it('rejects an invalid message limit before any socket', () => {
+    const runtimeSession = createSession();
+    expect(() => runtimeSession.observeWebSockets({ maxBytesPerMessage: 0 }, () => {})).toThrow();
+  });
+
+  it('observes text, binary, empty, and fragmented messages in both directions', async () => {
+    let replies = 0;
+    const server = await listenWebSocket((socket) => {
+      socket.on('data', () => {
+        if (replies > 0) return;
+        replies += 1;
+        socket.write(wsFrame(0x1, Buffer.from('hello')));
+        socket.write(wsFrame(0x2, Buffer.from([0, 255, 128])));
+        socket.write(wsFrame(0x1, Buffer.alloc(0)));
+        socket.write(Buffer.concat([
+          wsFrame(0x1, Buffer.from('hel'), false),
+          wsFrame(0x0, Buffer.from('lo'), true)
+        ]));
+      });
+    });
+    const runtimeSession = createSession();
+    const events: Array<{ direction: string; opcode: string; body: Uint8Array | null; text: string | null }> = [];
+    runtimeSession.observeWebSockets({}, (event) => {
+      if (event.phase === 'message') events.push(event);
+    });
+    const page = runtimeSession.createPage();
+    try {
+      expect(await page.webContents.executeJavaScript(openSocketScript(server.url, 4))).toBe('hello,binary,,hello');
+      const received = events.filter((event) => event.direction === 'received');
+      expect(received.map((event) => event.text)).toEqual(['hello', null, '', 'hello']);
+      expect(received[1]?.opcode).toBe('binary');
+      expect(Array.from(received[1]?.body ?? [])).toEqual([0, 255, 128]);
+      expect(received[3]?.body?.byteLength).toBe(5);
+      expect(events.some((event) => event.direction === 'sent' && event.text === 'ping')).toBe(true);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('truncates a long capture while the page receives the full message', async () => {
+    const payload = 'abcdefghij'.repeat(20);
+    const server = await listenWebSocket((socket) => {
+      socket.on('data', () => socket.write(wsFrame(0x1, Buffer.from(payload))));
+    });
+    const runtimeSession = createSession();
+    const events: Array<{ truncated: boolean; body: Uint8Array | null; text: string | null }> = [];
+    runtimeSession.observeWebSockets({ maxBytesPerMessage: 4 }, (event) => {
+      if (event.phase === 'message' && event.direction === 'received') events.push(event);
+    });
+    const page = runtimeSession.createPage();
+    try {
+      expect(await page.webContents.executeJavaScript(`
+        new Promise((resolve, reject) => {
+          const ws = new WebSocket(${JSON.stringify(server.url)});
+          ws.onmessage = (event) => resolve(event.data);
+          ws.onerror = () => reject(new Error('socket failed'));
+          ws.onopen = () => ws.send('x');
+        })
+      `)).toBe(payload);
+      const captured = events[0];
+      expect(captured?.truncated).toBe(true);
+      expect(captured?.text).toBe(null);
+      expect(Buffer.from(bytesOf(captured?.body ?? null)).toString('utf8')).toBe('abcd');
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('skips a second connection at the in-flight cap and still forwards it', async () => {
+    const server = await listenWebSocket((socket) => {
+      socket.on('data', () => socket.write(wsFrame(0x1, Buffer.from('one'))));
+    });
+    const runtimeSession = createSession();
+    const phases: string[] = [];
+    runtimeSession.observeWebSockets({ maxInFlight: 1 }, (event) => {
+      phases.push(`${event.phase}:${event.skipReason}`);
+    });
+    const page = runtimeSession.createPage();
+    const hold = `
+      new Promise((resolve, reject) => {
+        const ws = new WebSocket(${JSON.stringify(server.url)});
+        ws.onmessage = () => {};
+        ws.onerror = () => reject(new Error('socket failed'));
+        ws.onopen = () => resolve('open');
+      })
+    `;
+    try {
+      expect(await page.webContents.executeJavaScript(hold)).toBe('open');
+      expect(await page.webContents.executeJavaScript(`
+        new Promise((resolve, reject) => {
+          const ws = new WebSocket(${JSON.stringify(server.url)});
+          ws.onmessage = (event) => resolve(event.data);
+          ws.onerror = () => reject(new Error('socket failed'));
+          ws.onopen = () => ws.send('x');
+        })
+      `)).toBe('one');
+      expect(phases.includes('skipped:in-flight-limit')).toBe(true);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('isolates sessions, unsubscribe, and a webRequest listener', async () => {
+    const server = await listenWebSocket((socket) => {
+      socket.on('data', () => socket.write(wsFrame(0x1, Buffer.from('quiet'))));
+    });
+    const watched = createSession();
+    const other = createSession();
+    const plain = createSession();
+    const urls: string[] = [];
+    const stop = watched.observeWebSockets({}, (event) => {
+      if (event.phase === 'message') urls.push(event.url);
+    });
+    const webRequestHits: string[] = [];
+    watched.session.webRequest.onBeforeRequest({ urls: ['ws://127.0.0.1/*'] }, (details, callback) => {
+      webRequestHits.push(details.url);
+      callback({});
+    });
+    const script = `
+      new Promise((resolve, reject) => {
+        const ws = new WebSocket(${JSON.stringify(server.url)});
+        ws.onmessage = (event) => resolve(event.data);
+        ws.onerror = () => reject(new Error('socket failed'));
+        ws.onopen = () => ws.send('x');
+      })
+    `;
+    try {
+      expect(await plain.createPage().webContents.executeJavaScript(script)).toBe('quiet');
+      expect(await other.createPage().webContents.executeJavaScript(script)).toBe('quiet');
+      expect(urls).toEqual([]);
+      stop();
+      expect(await watched.createPage().webContents.executeJavaScript(script)).toBe('quiet');
+      expect(urls).toEqual([]);
+      watched.observeWebSockets({}, (event) => {
+        if (event.phase === 'message') urls.push(event.url);
+      });
+      expect(await watched.createPage().webContents.executeJavaScript(script)).toBe('quiet');
+      expect(urls.some((url) => url.startsWith('ws://127.0.0.1'))).toBe(true);
+      expect(webRequestHits.length).toBeGreaterThan(0);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('reports a failed handshake and a dropped connection', async () => {
+    const refused = http.createServer((_request, response) => {
+      response.writeHead(400);
+      response.end();
+    });
+    await new Promise<void>((resolve) => refused.listen(0, '127.0.0.1', resolve));
+    const refusedAddress = refused.address();
+    if (!refusedAddress || typeof refusedAddress === 'string') throw new Error('refused server has no port');
+    const refusedUrl = `ws://127.0.0.1:${refusedAddress.port}/nope`;
+    const dropped = await listenWebSocket((socket) => {
+      socket.destroy();
+    });
+    const runtimeSession = createSession();
+    const phases: string[] = [];
+    runtimeSession.observeWebSockets({}, (event) => {
+      phases.push(event.phase);
+    });
+    const page = runtimeSession.createPage();
+    try {
+      await expect(page.webContents.executeJavaScript(`
+        new Promise((resolve, reject) => {
+          const ws = new WebSocket(${JSON.stringify(refusedUrl)});
+          ws.onopen = () => resolve('open');
+          ws.onerror = () => reject(new Error('refused'));
+        })
+      `)).rejects.toThrow('refused');
+      expect(phases.includes('failed')).toBe(true);
+      await expect(page.webContents.executeJavaScript(`
+        new Promise((resolve, reject) => {
+          const ws = new WebSocket(${JSON.stringify(dropped.url)});
+          ws.onopen = () => resolve('open');
+          ws.onerror = () => reject(new Error('dropped'));
+          ws.onclose = () => reject(new Error('dropped'));
+        })
+      `)).rejects.toThrow('dropped');
+      expect(phases.includes('closed') || phases.includes('failed')).toBe(true);
+    } finally {
+      await dropped.close();
+      await new Promise((resolve) => refused.close(resolve));
     }
   });
 });

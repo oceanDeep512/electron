@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <deque>
 #include <memory>
 #include <string>
 #include <vector>
@@ -54,6 +55,9 @@ inline constexpr int kResponseBodyDefaultMaxInFlight = 8;
 inline constexpr int kResponseBodyMaxInFlight = 64;
 inline constexpr size_t kResponseBodyDefaultAggregateBytes = 8000000;
 inline constexpr size_t kResponseBodyMaxAggregateBytes = 64000000;
+// UI dispatch queue. Older events are dropped, and the next delivered event
+// reports how many were lost. The page request is not failed or stalled.
+inline constexpr size_t kResponseBodyMaxQueuedEvents = 64;
 
 // Limits for one session's response-body observation. Patterns are matched
 // against the full URL. An empty pattern list matches every http(s) URL.
@@ -80,6 +84,8 @@ struct ResponseBodyEvent {
   int error_code = 0;
   bool has_body = false;
   size_t buffered = 0;
+  // Events discarded from the UI queue before this one.
+  int queue_dropped = 0;
   std::vector<uint8_t> body;
 };
 
@@ -95,6 +101,7 @@ struct ResponseBodyTicket {
 };
 
 class ResponseBodyListener;
+class WebSocketObservation;
 
 // What makes a session's requests leave the direct renderer -> network path:
 // a webRequest listener that can block or modify them (routed through
@@ -119,11 +126,25 @@ class InterceptState : public base::RefCountedThreadSafe<InterceptState> {
     return response_body_enabled_.load(std::memory_order_acquire);
   }
 
-  // UI thread. Replacing the listener does not bump the generation, so a tee
-  // that already started can still deliver. Clearing does.
+  // UI thread. Installing or replacing the listener bumps the generation, so
+  // a tee from the previous subscription cannot deliver into the new one.
+  // Updating limits keeps the generation. Clearing bumps it and leaves any
+  // tee already forwarding the page body on that path.
   void InstallResponseBodyListener(std::unique_ptr<ResponseBodyListener> listener,
                                    ResponseBodyLimits limits);
+  void UpdateResponseBodyLimits(ResponseBodyLimits limits);
   void ClearResponseBodyObservation();
+
+  bool websocket_enabled() const {
+    return websocket_enabled_.load(std::memory_order_acquire);
+  }
+  void SetWebSocketEnabled(bool enabled) {
+    websocket_enabled_.store(enabled, std::memory_order_release);
+  }
+  WebSocketObservation* websocket_observation() { return websocket_.get(); }
+  void EnsureWebSocketObservation();
+  void ClearWebSocketObservation();
+  void DrainWebSocketQueue();
 
   // Any thread. kIgnore emits nothing. kSkip emits a skipped event and does
   // not reserve a slot. kClaim reserves one in-flight slot.
@@ -138,7 +159,7 @@ class InterceptState : public base::RefCountedThreadSafe<InterceptState> {
   friend class base::RefCountedThreadSafe<InterceptState>;
   ~InterceptState();
 
-  void DeliverResponseBody(ResponseBodyEvent event);
+  void DrainResponseBodyQueue();
 
   bool WantsURL(const GURL& url) const EXCLUSIVE_LOCKS_REQUIRED(lock_);
 
@@ -157,8 +178,17 @@ class InterceptState : public base::RefCountedThreadSafe<InterceptState> {
   int response_in_flight_ GUARDED_BY(lock_) = 0;
   size_t response_aggregate_ GUARDED_BY(lock_) = 0;
   uint64_t response_next_id_ GUARDED_BY(lock_) = 0;
+  std::deque<ResponseBodyEvent> response_queue_ GUARDED_BY(lock_);
+  size_t response_queued_bytes_ GUARDED_BY(lock_) = 0;
+  int response_queue_dropped_ GUARDED_BY(lock_) = 0;
+  bool response_queue_scheduled_ GUARDED_BY(lock_) = false;
   // Touched only on the UI thread. Cleared before the last ref can drop on IO.
   std::unique_ptr<ResponseBodyListener> response_body_listener_;
+
+  std::atomic<bool> websocket_enabled_{false};
+  // Defined in websocket_message_observer.h. Destroyed from ~InterceptState
+  // after that header is included.
+  std::unique_ptr<WebSocketObservation> websocket_;
 };
 
 // Starts a request on the IO thread with both URLLoader endpoints proxied so

@@ -129,6 +129,10 @@ class Session final : public gin::Wrappable<Session>,
                                  gin::Arguments* args);
   void SetResponseBodyObservation(v8::Local<v8::Value> listener,
                                   gin::Arguments* args);
+  void UpdateResponseBodyObservationLimits(gin::Arguments* args);
+  void SetWebSocketMessageObservation(v8::Local<v8::Value> listener,
+                                      gin::Arguments* args);
+  void UpdateWebSocketMessageObservationLimits(gin::Arguments* args);
   void SetDevicePermissionHandler(v8::Local<v8::Value> val,
                                   gin::Arguments* args);
   void SetUSBProtectedClassesHandler(v8::Local<v8::Value> val,

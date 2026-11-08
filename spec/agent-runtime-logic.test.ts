@@ -38,11 +38,17 @@ import {
   safeUrlForError,
   settleEffectGate,
   applyResponseObservation,
+  applyWebSocketObservation,
   createResponseObservationBudget,
+  createWebSocketObservationBudget,
   normalizeResponseObservation,
+  normalizeWebSocketObservation,
   responseUrlMatches,
   shouldArmNavigation,
   unionResponseObservationPolicies,
+  unionWebSocketObservationPolicies,
+  websocketUrlMatches,
+  WEBSOCKET_DEFAULT_MAX_BYTES,
   validatePersona,
   RESPONSE_DEFAULT_AGGREGATE_BYTES,
   RESPONSE_DEFAULT_MAX_BYTES,
@@ -52,7 +58,8 @@ import {
   RESPONSE_MAX_IN_FLIGHT,
   type NavigationEvent,
   type Persona,
-  type ResponseObservationEvent
+  type ResponseObservationEvent,
+  type WebSocketObservationEvent
 } from '../lib/browser/api/agent-runtime-logic.ts';
 
 function runPageScript(code: string, names: string[], values: unknown[]): unknown {
@@ -96,14 +103,14 @@ function validPersona(extra: Record<string, unknown> = {}): Record<string, unkno
   };
 }
 
-test('checkpoint records the pinned baseline and leaves websocket and persona off', () => {
+test('checkpoint records the pinned baseline and leaves persona off', () => {
   assert.equal(checkpoint.baseline, 'ef2710fa6c10fe56365a9949fa783d26ca1499e5');
   assert.equal(checkpoint.chromium, '159.0.8140.0');
   assert.equal(checkpoint.controlPlane, true);
   assert.equal(checkpoint.nativePersona, false);
   assert.equal(checkpoint.accessibilitySnapshot, true);
   assert.equal(checkpoint.responseBodyObservation, true);
-  assert.equal(checkpoint.webSocketMessageObservation, false);
+  assert.equal(checkpoint.webSocketMessageObservation, true);
   assert.equal(checkpoint.isolatedWorldId, 1001);
   assert.notEqual(checkpoint.isolatedWorldId, 0);
   assert.notEqual(checkpoint.isolatedWorldId, 999);
@@ -634,6 +641,7 @@ function responseEvent(extra: Partial<ResponseObservationEvent> = {}): ResponseO
     truncated: false,
     skipReason: '',
     errorCode: 0,
+    queueDropped: 0,
     body: new Uint8Array([0, 255, 128, 65, 66]),
     ...extra
   };
@@ -708,5 +716,98 @@ test('response delivery keeps exact bytes, skips overflow, and invents no redire
   assert.equal(union.maxBytesPerResponse, 8);
   assert.equal(union.maxInFlight, 2);
   const caughtAll = unionResponseObservationPolicies([policy, normalizeResponseObservation({})]);
+  assert.deepEqual(caughtAll.urls, []);
+  assert.equal(completed?.queueDropped, 0);
+});
+
+function socketEvent(extra: Partial<WebSocketObservationEvent> = {}): WebSocketObservationEvent {
+  return {
+    connectionId: '1',
+    messageId: 'm1',
+    phase: 'message',
+    url: 'ws://127.0.0.1/socket',
+    direction: 'received',
+    opcode: 'text',
+    body: new Uint8Array([104, 105]),
+    text: null,
+    truncated: false,
+    skipReason: '',
+    wireCompressed: false,
+    wasClean: false,
+    code: 0,
+    reason: '',
+    errorCode: 0,
+    queueDropped: 0,
+    ...extra
+  };
+}
+
+test('websocket observation copies exact bytes and decodes only complete text', () => {
+  assert.equal(normalizeWebSocketObservation({}).maxBytesPerMessage, WEBSOCKET_DEFAULT_MAX_BYTES);
+  assert.throws(() => normalizeWebSocketObservation({ maxBytesPerMessage: 0 }), (error: unknown) => {
+    return error instanceof AgentRuntimeError && error.code === 'invalid-websocket-observation';
+  });
+  assert.equal(websocketUrlMatches([], 'ws://127.0.0.1/socket'), true);
+  assert.equal(websocketUrlMatches([], 'https://127.0.0.1/socket'), false);
+  assert.equal(websocketUrlMatches(['wss://example.test/*'], 'wss://example.test/a'), true);
+
+  const policy = normalizeWebSocketObservation({
+    urls: ['ws://127.0.0.1/'],
+    maxBytesPerMessage: 4,
+    maxInFlight: 1,
+    maxAggregateBytes: 8
+  });
+  const budget = createWebSocketObservationBudget();
+  const opened = applyWebSocketObservation(policy, budget, socketEvent({ phase: 'opened', body: null, messageId: '' }));
+  assert.equal(opened?.phase, 'opened');
+  assert.equal(budget.inFlight, 1);
+  const blocked = applyWebSocketObservation(policy, budget, socketEvent({
+    phase: 'opened',
+    connectionId: '2',
+    body: null,
+    messageId: ''
+  }));
+  assert.equal(blocked?.phase, 'skipped');
+  assert.equal(blocked?.skipReason, 'in-flight-limit');
+  assert.equal(applyWebSocketObservation(policy, budget, socketEvent({
+    phase: 'message',
+    connectionId: '2',
+    messageId: 'm2'
+  })), null);
+
+  const text = applyWebSocketObservation(policy, budget, socketEvent());
+  assert.equal(text?.text, 'hi');
+  assert.deepEqual(Array.from(text?.body ?? []), [104, 105]);
+  const empty = applyWebSocketObservation(policy, budget, socketEvent({ body: new Uint8Array() }));
+  assert.equal(empty?.text, '');
+  assert.equal(empty?.body?.byteLength, 0);
+  const binary = applyWebSocketObservation(policy, budget, socketEvent({
+    opcode: 'binary',
+    body: new Uint8Array([0, 255])
+  }));
+  assert.equal(binary?.text, null);
+  assert.deepEqual(Array.from(binary?.body ?? []), [0, 255]);
+  const invalid = applyWebSocketObservation(policy, budget, socketEvent({ body: new Uint8Array([0xff]) }));
+  assert.equal(invalid?.text, null);
+  assert.deepEqual(Array.from(invalid?.body ?? []), [0xff]);
+  const truncated = applyWebSocketObservation(policy, budget, socketEvent({
+    body: new Uint8Array([97, 98, 99, 100, 101])
+  }));
+  assert.equal(truncated?.truncated, true);
+  assert.equal(truncated?.text, null);
+  assert.deepEqual(Array.from(truncated?.body ?? []), [97, 98, 99, 100]);
+  const other = applyWebSocketObservation(policy, budget, socketEvent({ url: 'ws://other.test/' }));
+  assert.equal(other, null);
+  const closed = applyWebSocketObservation(policy, budget, socketEvent({ phase: 'closed', wasClean: true, code: 1000 }));
+  assert.equal(closed?.body, null);
+  assert.equal(budget.inFlight, 0);
+
+  const union = unionWebSocketObservationPolicies([
+    policy,
+    normalizeWebSocketObservation({ urls: ['wss://example.test/'], maxBytesPerMessage: 8, maxInFlight: 2, maxAggregateBytes: 9 })
+  ]);
+  assert.deepEqual(union.urls, ['ws://127.0.0.1/', 'wss://example.test/']);
+  assert.equal(union.maxBytesPerMessage, 8);
+  const caughtAll = unionWebSocketObservationPolicies([policy, normalizeWebSocketObservation({})]);
   assert.deepEqual(caughtAll.urls, []);
 });

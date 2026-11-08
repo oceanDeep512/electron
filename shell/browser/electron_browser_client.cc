@@ -1653,8 +1653,19 @@ bool ElectronBrowserClient::HasWebRequestAPIProxy(
 
 bool ElectronBrowserClient::WillInterceptWebSocket(
     content::RenderFrameHost* frame) {
+  // Shared workers and service workers call this with a null frame
+  // (frame_routing_id is kRoutingIdNone). Dedicated workers pass the creator
+  // document's frame and share this path with pages. Main-process
+  // net.WebSocket never reaches here.
   if (!frame)
     return false;
+
+  auto* context =
+      static_cast<ElectronBrowserContext*>(frame->GetBrowserContext());
+  if (context && context->intercept_state() &&
+      context->intercept_state()->websocket_enabled()) {
+    return true;
+  }
 
   v8::Isolate* isolate = JavascriptEnvironment::GetIsolate();
   v8::HandleScope scope(isolate);
@@ -1694,9 +1705,16 @@ void ElectronBrowserClient::CreateWebSocket(
 
   auto* web_request = api::WebRequest::FromOrCreate(isolate, browser_context);
   DCHECK(web_request);
+  auto* electron_context = static_cast<ElectronBrowserContext*>(browser_context);
+  const bool observe_messages =
+      electron_context->intercept_state() &&
+      electron_context->intercept_state()->websocket_enabled();
 
 #if BUILDFLAG(ENABLE_ELECTRON_EXTENSIONS)
-  if (!web_request->HasListener()) {
+  // Extension websocket proxies replace this hop. They are not wrapped, so
+  // message observation does not see those sockets. Observation itself skips
+  // this return and uses ProxyingWebSocket.
+  if (!observe_messages && !web_request->HasListener()) {
     auto* web_request_api = extensions::BrowserContextKeyedAPIFactory<
         extensions::WebRequestAPI>::Get(browser_context);
 

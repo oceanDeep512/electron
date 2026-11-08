@@ -199,6 +199,7 @@ auto_filenames = {
     "docs/api/structures/window-open-handler-response.md",
     "docs/api/structures/window-session-end-event.md",
     "docs/api/structures/window-state-persistence.md",
+    "docs/api/structures/websocket-message-observation.md",
   ]
 
   node_header_sources = [
