@@ -338,6 +338,23 @@ inline constexpr base::cstring_view kAgentHardwareConcurrency =
 inline constexpr base::cstring_view kAgentDeviceMemory =
     "electron-agent-device-memory";
 inline constexpr base::cstring_view kAgentTimezone = "electron-agent-timezone";
+inline constexpr base::cstring_view kAgentScreen = "electron-agent-screen";
+inline constexpr base::cstring_view kAgentWebGLVendor =
+    "electron-agent-webgl-vendor";
+inline constexpr base::cstring_view kAgentWebGLRenderer =
+    "electron-agent-webgl-renderer";
+inline constexpr base::cstring_view kAgentWebGPUVendor =
+    "electron-agent-webgpu-vendor";
+inline constexpr base::cstring_view kAgentWebGPUArchitecture =
+    "electron-agent-webgpu-architecture";
+inline constexpr base::cstring_view kAgentWebGPUDevice =
+    "electron-agent-webgpu-device";
+inline constexpr base::cstring_view kAgentWebGPUDescription =
+    "electron-agent-webgpu-description";
+inline constexpr base::cstring_view kAgentCanvasSeed =
+    "electron-agent-canvas-seed";
+inline constexpr base::cstring_view kAgentAudioSeed =
+    "electron-agent-audio-seed";
 
 }  // namespace switches
 

@@ -8,6 +8,8 @@ added:
 changes:
   - pr-url: https://github.com/oceanDeep512/electron/pull/1
     description: "Applied user agent, language, timezone, and hardware persona surfaces."
+  - pr-url: https://github.com/oceanDeep512/electron/pull/1
+    description: "Applied screen, graphics identifiers, canvas and audio readback, and WebRTC persona surfaces."
 ```
 -->
 
@@ -18,9 +20,11 @@ Process: [Main](../glossary.md#main-process)
 `agentRuntime` creates named partitions and drives pages without the debugger.
 It does not change webPreferences of a page it did not create. A persona applies
 user agent, client hints metadata, accept languages, timezone, hardware concurrency,
-and device memory, including dedicated workers, shared workers, and service
-workers. Screen, WebGL, WebGPU, canvas, audio, WebRTC policy, and font
-policy `core` are not applied.
+device memory, screen metrics, WebGL and WebGPU identifiers, canvas and audio
+readback, and WebRTC IP handling. Dedicated workers share the document process.
+Shared workers and service workers receive the same user agent, metadata, and
+renderer switches when their process starts after the persona. Font policy
+`core` is rejected.
 
 ```js
 const { agentRuntime } = require('electron')
@@ -55,12 +59,12 @@ An `Object` frozen record of the pinned baseline and which stages are present in
   * `timezone` boolean - `true` for that session's renderer processes, including their workers.
   * `hardwareConcurrency` boolean
   * `deviceMemory` boolean
-  * `screen` boolean - `false`.
-  * `webgl` boolean - `false`.
-  * `webgpu` boolean - `false`.
-  * `canvas` boolean - `false`. The seed is stored and does not change pixels.
-  * `audio` boolean - `false`.
-  * `webrtc` boolean - `false`. Only `default` is accepted.
+  * `screen` boolean - `true` for `screen` metrics, `device-width` and `device-height` media, and `window.devicePixelRatio`. Layout and offscreen rendering keep the real scale.
+  * `webgl` boolean - `true` for `GL_VENDOR`, `GL_RENDERER`, and the unmasked vendor and renderer strings.
+  * `webgpu` boolean - `true` for adapter vendor, architecture, device, and description. Adapter limits stay real.
+  * `canvas` boolean - `true` for seeded readback perturbation. The displayed bitmap is not changed.
+  * `audio` boolean - `true` for a seeded perturbation of an `OfflineAudioContext` result and `AnalyserNode` readings.
+  * `webrtc` boolean - `true`. `default` leaves Chromium's policy. The other accepted policies are written to each page's renderer preferences.
   * `fonts` boolean - `false`. `fontPolicy: "core"` is rejected.
 * `accessibilitySnapshot` boolean - `true` when `page.snapshot()` is wired to `WebContents::RequestAXTreeSnapshot`.
 * `responseBodyObservation` boolean - `true` when `session.observeResponses()` is wired to the URL loader tee.
@@ -79,7 +83,7 @@ An `Error` subclass thrown by this module. `error.code` is a string such as
 * `options` Object
   * `partition` string - Required partition name. Must not be empty. An empty string is rejected so this method never uses the default session.
   * `persist` boolean (optional) - When omitted, a `persist:` prefix means persistent storage and a bare name means in-memory storage.
-  * `persona` [AgentPersona](structures/agent-persona.md) (optional) - Applies the implemented surfaces before the partition's first page. `null` is invalid. `screen`, `webgl`, `webgpu`, and a non-default `webrtcIpHandlingPolicy` fail with `persona-surface-unavailable` and apply nothing. `fontPolicy: "core"` fails with `font-policy-unavailable`.
+  * `persona` [AgentPersona](structures/agent-persona.md) (optional) - Applies the implemented surfaces before the partition's first renderer or service worker. `null` is invalid. `fontPolicy: "core"` fails with `font-policy-unavailable` and applies nothing. A renderer or service worker that is already running in the partition is rejected.
 
 Returns [`AgentSession`](agent-runtime.md#class-agentsession)
 

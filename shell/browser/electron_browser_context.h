@@ -114,6 +114,20 @@ class ElectronBrowserContext : public content::BrowserContext {
     std::vector<std::pair<std::string, std::string>> brands;
     std::vector<std::pair<std::string, std::string>> full_version_list;
     std::vector<std::string> form_factors;
+    std::string seed;
+    int screen_width = 0;
+    int screen_height = 0;
+    int screen_avail_width = 0;
+    int screen_avail_height = 0;
+    int screen_color_depth = 0;
+    double screen_device_scale_factor = 0;
+    std::string webgl_vendor;
+    std::string webgl_renderer;
+    std::string webgpu_vendor;
+    std::string webgpu_architecture;
+    std::string webgpu_device;
+    std::string webgpu_description;
+    std::string webrtc_ip_handling_policy;
   };
 
   // Empty string on success. A non-empty string is a caller error.

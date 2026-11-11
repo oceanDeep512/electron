@@ -43,6 +43,7 @@
 #include "content/public/browser/preconnect_manager.h"
 #include "content/public/browser/render_frame_host.h"
 #include "content/public/browser/render_process_host.h"
+#include "content/public/browser/service_worker_context.h"
 #include "content/public/browser/storage_partition.h"
 #include "content/public/browser/web_contents.h"
 #include "net/http/http_util.h"
@@ -554,6 +555,27 @@ std::string ElectronBrowserContext::ApplyAgentPersona(AgentPersona persona) {
        content::WebContents::GetAllWebContents()) {
     if (contents && contents->GetBrowserContext() == this) {
       return "persona must be applied before the first page in this partition";
+    }
+  }
+  // A renderer or service worker started outside agentRuntime would keep the
+  // command line it was launched with, so the persona switches would never
+  // arrive. Spare renderers for this partition count: they are already alive.
+  content::StoragePartition* partition = GetDefaultStoragePartition();
+  for (auto it = content::RenderProcessHost::AllHostsIterator(); !it.IsAtEnd();
+       it.Advance()) {
+    content::RenderProcessHost* host = it.GetCurrentValue();
+    if (!host || host->IsDeletingSoon())
+      continue;
+    if (host->GetBrowserContext() == this ||
+        (partition && host->InSameStoragePartition(partition))) {
+      return "persona must be applied before the first renderer in this partition";
+    }
+  }
+  if (partition) {
+    if (auto* workers = partition->GetServiceWorkerContext()) {
+      if (!workers->GetRunningServiceWorkerInfos().empty()) {
+        return "persona must be applied before the first renderer in this partition";
+      }
     }
   }
   // Create the zone to reject an id ICU does not know. adoptDefault is not

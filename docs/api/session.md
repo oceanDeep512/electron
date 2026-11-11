@@ -1599,12 +1599,15 @@ session.defaultSession.allowNTLMCredentialsForDomains('*')
 added:
   - pr-url: https://github.com/oceanDeep512/electron/pull/1
     description: "Added a session persona for user agent, language, timezone, and hardware."
+changes:
+  - pr-url: https://github.com/oceanDeep512/electron/pull/1
+    description: "Extended the session persona to screen, graphics, canvas, audio, and WebRTC."
 ```
 -->
 
 * `persona` [AgentPersonaApply](structures/agent-persona-apply.md)
 
-Throws if this partition already has a page or a different persona. `agentRuntime.createSession({ persona })` is the supported caller. The metadata is the document `User-Agent` override, including `Sec-CH-UA*` on that override. Dedicated workers copy that override. Shared workers and service workers receive the same user agent and metadata through `OverrideUserAgentForBrowserContext`. Timezone, `hardwareConcurrency`, and `deviceMemory` are delivered only to this session's renderer processes.
+Throws if this partition already has a different persona, a page, a renderer process, or a running service worker. `agentRuntime.createSession({ persona })` is the supported caller. The metadata is the document `User-Agent` override, including `Sec-CH-UA*` on that override. Dedicated workers copy that override. Shared workers and service workers receive the same user agent and metadata through `OverrideUserAgentForBrowserContext`. Timezone, hardware, screen, WebGL, WebGPU, and the canvas and audio seeds are command-line switches on this session's renderer processes. A non-default WebRTC policy is written to each page's renderer preferences.
 
 #### `ses.setUserAgent(userAgent[, acceptLanguages])`
 

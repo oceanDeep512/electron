@@ -1,0 +1,164 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Electron Agent Runtime <agent-runtime@electron.local>
+Date: Wed, 11 Nov 2026 19:10:00 +0000
+Subject: [electron] perturb offline audio results and analyser readings
+
+An agent persona passes these values on the renderer command line. The
+switches are absent unless that renderer belongs to a persona session, so
+other processes keep Chromium's behavior. Nothing here is compiled in this
+change.
+
+diff --git a/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc b/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
+--- a/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
++++ b/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
+@@ -25,8 +25,11 @@
+ 
+ #include "third_party/blink/renderer/modules/webaudio/offline_audio_context.h"
+ 
++#include <cstring>
+ #include <optional>
+ 
++#include "base/command_line.h"
++
+ #include "base/metrics/histogram_functions.h"
+ #include "base/metrics/histogram_macros.h"
+ #include "base/numerics/safe_conversions.h"
+@@ -560,6 +563,40 @@
+   return promise;
+ }
+ 
++
++uint32_t AgentAudioHash() {
++  const std::string seed =
++      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++          "electron-agent-audio-seed");
++  uint32_t hash = 2166136261u;
++  for (unsigned char c : seed)
++    hash = (hash ^ c) * 16777619u;
++  return hash;
++}
++
++bool AgentAudioEnabled() {
++  return base::CommandLine::ForCurrentProcess()->HasSwitch(
++      "electron-agent-audio-seed");
++}
++
++void PerturbOfflineResult(AudioBuffer* buffer) {
++  if (!AgentAudioEnabled() || !buffer)
++    return;
++  const uint32_t hash = AgentAudioHash();
++  for (unsigned channel = 0; channel < buffer->numberOfChannels(); ++channel) {
++    NotShared<DOMFloat32Array> data = buffer->getChannelData(channel);
++    if (!data)
++      continue;
++    base::span<float> samples = data.Get()->AsSpan();
++    for (size_t i = 0; i < samples.size(); i += 64) {
++      uint32_t bits = 0;
++      memcpy(&bits, &samples[i], sizeof(bits));
++      uint32_t mixed = (hash ^ static_cast<uint32_t>(i) ^ bits) * 0x9E3779B1u;
++      samples[i] += ((mixed & 1u) ? 1.0f : -1.0f) * 1.0e-7f;
++    }
++  }
++}
++
+ void OfflineAudioContext::OnChunkRendered() {
+   DCHECK(IsMainThread());
+ 
+@@ -578,6 +615,7 @@
+   Member<AudioBuffer> rendered_buffer = pending_render_targets_.front();
+ 
+   CHECK(rendered_buffer);
++  PerturbOfflineResult(rendered_buffer.Get());
+   // Keep the target queued across `Resolve()` so synchronous thenable getters
+   // can enqueue more chunks without starting a duplicate render.
+   resolver->Resolve(rendered_buffer.Get());
+diff --git a/third_party/blink/renderer/modules/webaudio/analyser_node.cc b/third_party/blink/renderer/modules/webaudio/analyser_node.cc
+--- a/third_party/blink/renderer/modules/webaudio/analyser_node.cc
++++ b/third_party/blink/renderer/modules/webaudio/analyser_node.cc
+@@ -25,6 +25,9 @@
+ 
+ #include "third_party/blink/renderer/modules/webaudio/analyser_node.h"
+ 
++#include <cstring>
++
++#include "base/command_line.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_analyser_options.h"
+ #include "third_party/blink/renderer/modules/webaudio/analyser_handler.h"
+ #include "third_party/blink/renderer/modules/webaudio/audio_graph_tracer.h"
+@@ -32,6 +35,52 @@
+ 
+ namespace blink {
+ 
++
++uint32_t AgentAudioHash() {
++  const std::string seed =
++      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++          "electron-agent-audio-seed");
++  uint32_t hash = 2166136261u;
++  for (unsigned char c : seed)
++    hash = (hash ^ c) * 16777619u;
++  return hash;
++}
++
++bool AgentAudioEnabled() {
++  return base::CommandLine::ForCurrentProcess()->HasSwitch(
++      "electron-agent-audio-seed");
++}
++
++void PerturbAnalyserFloats(DOMFloat32Array* array) {
++  if (!AgentAudioEnabled() || !array)
++    return;
++  const uint32_t hash = AgentAudioHash();
++  base::span<float> samples = array->AsSpan();
++  for (size_t i = 0; i < samples.size(); i += 64) {
++    uint32_t bits = 0;
++    memcpy(&bits, &samples[i], sizeof(bits));
++    uint32_t mixed = (hash ^ static_cast<uint32_t>(i) ^ bits) * 0x9E3779B1u;
++    samples[i] += ((mixed & 1u) ? 1.0f : -1.0f) * 1.0e-7f;
++  }
++}
++
++void PerturbAnalyserBytes(DOMUint8Array* array) {
++  if (!AgentAudioEnabled() || !array)
++    return;
++  const uint32_t hash = AgentAudioHash();
++  base::span<uint8_t> bytes = array->AsSpan();
++  for (size_t i = 0; i < bytes.size(); i += 64) {
++    uint32_t mixed = (hash ^ static_cast<uint32_t>(i) ^ bytes[i]) * 0x9E3779B1u;
++    if (mixed & 1u) {
++      bytes[i] = bytes[i] == 255 ? static_cast<uint8_t>(254)
++                                 : static_cast<uint8_t>(bytes[i] + 1);
++    } else {
++      bytes[i] = bytes[i] == 0 ? static_cast<uint8_t>(1)
++                               : static_cast<uint8_t>(bytes[i] - 1);
++    }
++  }
++}
++
+ AnalyserNode::AnalyserNode(BaseAudioContext& context) : AudioNode(context) {
+   SetHandler(AnalyserHandler::Create(*this, context.sampleRate()));
+ }
+@@ -126,19 +175,23 @@
+ void AnalyserNode::getFloatFrequencyData(NotShared<DOMFloat32Array> array) {
+   GetAnalyserHandler().GetFloatFrequencyData(array.Get(),
+                                              context()->currentTime());
++  PerturbAnalyserFloats(array.Get());
+ }
+ 
+ void AnalyserNode::getByteFrequencyData(NotShared<DOMUint8Array> array) {
+   GetAnalyserHandler().GetByteFrequencyData(array.Get(),
+                                             context()->currentTime());
++  PerturbAnalyserBytes(array.Get());
+ }
+ 
+ void AnalyserNode::getFloatTimeDomainData(NotShared<DOMFloat32Array> array) {
+   GetAnalyserHandler().GetFloatTimeDomainData(array.Get());
++  PerturbAnalyserFloats(array.Get());
+ }
+ 
+ void AnalyserNode::getByteTimeDomainData(NotShared<DOMUint8Array> array) {
+   GetAnalyserHandler().GetByteTimeDomainData(array.Get());
++  PerturbAnalyserBytes(array.Get());
+ }
+ 
+ void AnalyserNode::ReportDidCreate() {

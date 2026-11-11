@@ -129,11 +129,16 @@ interface NativeResponseSession {
   updateWebSocketMessageObservationLimits(options: WebSocketObservationPolicy): void;
   setAgentPersona(persona: {
     id: string;
+    seed: string;
     userAgent: string;
     acceptLanguages: string;
     timezone: string;
     hardwareConcurrency: number;
     deviceMemory: number;
+    screen?: Persona['screen'];
+    webgl?: Persona['webgl'];
+    webgpu?: Persona['webgpu'];
+    webrtcIpHandlingPolicy?: Persona['webrtcIpHandlingPolicy'];
     brands: { brand: string; version: string }[];
     fullVersionList: { brand: string; version: string }[];
     fullVersion: string;
@@ -922,7 +927,12 @@ const sessions = new Map<string, AgentSession>();
 function nativePersonaPayload(persona: Persona) {
   return {
     id: personaStorageId(persona),
+    seed: persona.seed,
     userAgent: persona.userAgent,
+    ...(persona.screen ? { screen: persona.screen } : {}),
+    ...(persona.webgl ? { webgl: persona.webgl } : {}),
+    ...(persona.webgpu ? { webgpu: persona.webgpu } : {}),
+    webrtcIpHandlingPolicy: persona.webrtcIpHandlingPolicy,
     acceptLanguages: persona.acceptLanguages.join(','),
     timezone: persona.timezone,
     hardwareConcurrency: persona.hardwareConcurrency,

@@ -21,12 +21,12 @@ export const checkpoint = Object.freeze({
     timezone: true,
     hardwareConcurrency: true,
     deviceMemory: true,
-    screen: false,
-    webgl: false,
-    webgpu: false,
-    canvas: false,
-    audio: false,
-    webrtc: false,
+    screen: true,
+    webgl: true,
+    webgpu: true,
+    canvas: true,
+    audio: true,
+    webrtc: true,
     fonts: false
   },
   // The snapshot API is wired to WebContents::RequestAXTreeSnapshot.
@@ -496,15 +496,8 @@ export function decidePersona(persona: unknown): PersonaDecision {
   }
   const validated = validatePersona(persona);
   if (!validated.ok) return { action: 'invalid', errors: validated.errors };
-  const surfaces: string[] = [];
-  if (validated.persona.screen) surfaces.push('screen');
-  if (validated.persona.webgl) surfaces.push('webgl');
-  if (validated.persona.webgpu) surfaces.push('webgpu');
-  if (validated.persona.webrtcIpHandlingPolicy !== 'default') surfaces.push('webrtc');
-  // seed is stored for a later canvas stage and does not perturb pixels yet.
-  if (surfaces.length > 0) {
-    return { action: 'unavailable', persona: validated.persona, surfaces };
-  }
+  // fontPolicy 'core' is rejected in validatePersona. Every other surface in
+  // this checkpoint is applied. The seed perturbs canvas and audio readback.
   return { action: 'apply', persona: validated.persona };
 }
 

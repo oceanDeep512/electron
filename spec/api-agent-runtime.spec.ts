@@ -107,7 +107,12 @@ describe('agentRuntime checkpoint', () => {
     expect(agentRuntime.checkpoint.controlPlane).toBe(true);
     expect(agentRuntime.checkpoint.nativePersona.userAgent).toBe(true);
     expect(agentRuntime.checkpoint.nativePersona.timezone).toBe(true);
-    expect(agentRuntime.checkpoint.nativePersona.screen).toBe(false);
+    expect(agentRuntime.checkpoint.nativePersona.screen).toBe(true);
+    expect(agentRuntime.checkpoint.nativePersona.webgl).toBe(true);
+    expect(agentRuntime.checkpoint.nativePersona.webgpu).toBe(true);
+    expect(agentRuntime.checkpoint.nativePersona.canvas).toBe(true);
+    expect(agentRuntime.checkpoint.nativePersona.audio).toBe(true);
+    expect(agentRuntime.checkpoint.nativePersona.webrtc).toBe(true);
     expect(agentRuntime.checkpoint.nativePersona.fonts).toBe(false);
     expect(agentRuntime.checkpoint.accessibilitySnapshot).toBe(true);
     expect(agentRuntime.checkpoint.responseBodyObservation).toBe(true);
@@ -133,16 +138,8 @@ describe('agentRuntime checkpoint', () => {
     }
   });
 
-  it('rejects a persona instead of leaving the renderer unchanged', () => {
-    const persona = samplePersona();
-    expect(agentRuntime.validatePersona(persona).ok).toBe(true);
+  it('rejects an invalid persona and fontPolicy core before applying anything', () => {
     const partition = partitionName();
-    try {
-      agentRuntime.createSession({ partition, persona });
-      expect.fail('unimplemented surfaces should be refused');
-    } catch (error) {
-      expect(errorCode(error)).toBe('persona-surface-unavailable');
-    }
     try {
       // @ts-expect-error a seed by itself is not a persona
       agentRuntime.createSession({ partition, persona: { seed: 'only' } });
@@ -151,16 +148,13 @@ describe('agentRuntime checkpoint', () => {
       expect(errorCode(error)).toBe('invalid-persona');
     }
     const core = samplePersona();
-    delete core.screen;
-    delete core.webgl;
-    delete core.webgpu;
-    core.webrtcIpHandlingPolicy = 'default';
     core.fontPolicy = 'core';
     try {
       agentRuntime.createSession({ partition, persona: core });
       expect.fail('fontPolicy core should be rejected');
     } catch (error) {
       expect(errorCode(error)).toBe('font-policy-unavailable');
+      expect(String(error)).toContain("fontPolicy 'core' is not implemented on this platform and is rejected");
     }
     const created = createSession({ partition });
     expect(created.personaApplied).toBe(false);
@@ -169,10 +163,7 @@ describe('agentRuntime checkpoint', () => {
 
   it('applies the implemented persona surfaces and refuses a different persona on the same partition', () => {
     const persona = samplePersona();
-    delete persona.screen;
-    delete persona.webgl;
-    delete persona.webgpu;
-    persona.webrtcIpHandlingPolicy = 'default';
+    persona.webrtcIpHandlingPolicy = 'default_public_interface_only';
     persona.fontPolicy = 'real';
     const partition = partitionName();
     const created = createSession({ partition, persona });
@@ -180,10 +171,7 @@ describe('agentRuntime checkpoint', () => {
     expect(typeof created.personaId).toBe('string');
     expect(agentRuntime.createSession({ partition, persona })).toBe(created);
     const other = samplePersona();
-    delete other.screen;
-    delete other.webgl;
-    delete other.webgpu;
-    other.webrtcIpHandlingPolicy = 'default';
+    other.webrtcIpHandlingPolicy = 'default_public_interface_only';
     other.userAgent = 'Mozilla/5.0 Other';
     expect(() => agentRuntime.createSession({ partition, persona: other })).toThrow();
   });

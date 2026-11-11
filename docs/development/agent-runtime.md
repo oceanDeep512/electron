@@ -1,6 +1,6 @@
 # Agent Runtime
 
-This page records the fifth checkpoint of the agent runtime. The control plane, accessibility snapshots, HTTP response bodies, and page WebSocket messages remain. A persona can now apply user agent, client hints metadata, accept languages, timezone, hardware concurrency, and device memory. Screen, graphics, canvas, audio, WebRTC, and fonts are still not applied. The C++ and the Chromium patches are source only: they have not been compiled or run.
+This page records the persona checkpoint of the agent runtime. The control plane, accessibility snapshots, HTTP response bodies, and page WebSocket messages remain. A persona can apply user agent, client hints metadata, accept languages, timezone, hardware concurrency, device memory, screen metrics, WebGL and WebGPU identifiers, canvas and audio readback, and WebRTC IP handling. `fontPolicy: "core"` is still rejected. The C++ and the Chromium patches are source only: they have not been compiled or run.
 
 ## Status of this checkpoint
 
@@ -11,12 +11,12 @@ This page records the fifth checkpoint of the agent runtime. The control plane, 
 | Public docs and generated TypeScript surface | `docs/api/agent-runtime.md` and `webContents.captureAccessibilitySnapshot` |
 | Navigation, locator, and input without CDP | Implemented, with the boundaries below |
 | Persona config validation | Implemented as a pure check |
-| Applying a fingerprint persona | User agent, client hints metadata, accept languages, timezone, hardware concurrency, and device memory are wired. Screen, WebGL, WebGPU, canvas, audio, WebRTC, and `fontPolicy: "core"` are refused. Source only, not compiled |
+| Applying a fingerprint persona | User agent, client hints, accept languages, timezone, hardware, screen metrics, WebGL and WebGPU identifiers, canvas and audio readback, and WebRTC IP handling are wired in source. `fontPolicy: "core"` is rejected. Source only, not compiled |
 | Accessibility snapshot | Wired to `WebContents::RequestAXTreeSnapshot`. Source only, not compiled |
 | HTTP response body observation | Wired through `session.observeResponses()`. Source only, not compiled |
 | WebSocket message observation | Wired through `session.observeWebSockets()` for page and dedicated-worker sockets. Source only, not compiled |
 
-`electron.agentRuntime.checkpoint` exposes the same flags at runtime. `accessibilitySnapshot`, `responseBodyObservation`, and `webSocketMessageObservation` are true. `nativePersona` is an object: user agent, client hints, accept languages, timezone, hardware concurrency, and device memory are true. Screen, WebGL, WebGPU, canvas, audio, WebRTC, and fonts are false.
+`electron.agentRuntime.checkpoint` exposes the same flags at runtime. `accessibilitySnapshot`, `responseBodyObservation`, and `webSocketMessageObservation` are true. `nativePersona` is an object. User agent, client hints, accept languages, timezone, hardware concurrency, device memory, screen, WebGL, WebGPU, canvas, audio, and WebRTC are true. Fonts are false.
 
 ## Pinned baseline
 
@@ -65,11 +65,9 @@ The registry that remembers open sessions is main-process bookkeeping. It is not
 
 `persist: true` stores `persist:` plus the name. `persist: false` stores the bare name and conflicts with a `persist:` prefix. When `persist` is omitted, a `persist:` prefix means persistent storage and a bare name means in-memory storage.
 
-`validatePersona` only checks the shape of a future persona. A successful result means the object is well formed. It does not change a renderer, the network stack, Client Hints, timezone, WebGL, canvas, audio, fonts, or WebRTC. `createSession` with a persona object fails with `native-persona-unavailable` before `session.fromPartition`, so a rejected persona does not reserve the partition. `persona: null` is invalid. Omit the property to create a normal session.
+`validatePersona` only checks the shape. A successful result does not by itself change a renderer. `createSession` applies a valid persona after `session.fromPartition` and before any page. `persona: null` is invalid. Omit the property to create a normal session. `fontPolicy: "core"` fails validation with `font-policy-unavailable` and does not reserve the partition.
 
-The future native stage must apply a persona before the first renderer for that partition starts, including service workers, and must keep it immutable for the life of the partition. `personaStorageId` is the canonical JSON of a validated persona. `createSession` does not call it and does not keep a persona map. Two open handles may share a partition only when persistence matches and both persona ids are null.
-
-`fontPolicy: "core"` can pass validation. It is still not applied. The native stage must reject that policy if it cannot be implemented honestly.
+`personaStorageId` is the canonical JSON of a validated persona. Two open handles may share a partition only when persistence matches and the persona id matches. A different id throws `partition-conflict`. The native side also refuses a second id, and it refuses an apply after any page, renderer process, or running service worker exists in that partition. The renderer check walks `RenderProcessHost::AllHostsIterator`, including a spare renderer that already belongs to the partition, and `StoragePartition::GetServiceWorkerContext()->GetRunningServiceWorkerInfos()`.
 
 ## Navigation
 
@@ -137,22 +135,44 @@ Incoming fragmentation follows `fin` and `WebSocketMessageType`. A message is em
 
 ## Persona surfaces in this checkpoint
 
-`createSession({ persona })` applies a persona only when every requested surface is implemented. `screen`, `webgl`, `webgpu`, and a non-default `webrtcIpHandlingPolicy` throw `persona-surface-unavailable` and do not call the native apply. `fontPolicy: "core"` throws `font-policy-unavailable`. `fontPolicy: "real"` and `webrtcIpHandlingPolicy: "default"` leave those stacks unchanged.
+`fontPolicy: "core"` throws `font-policy-unavailable` and applies nothing. Every other field on a valid persona is applied. `webrtcIpHandlingPolicy: "default"` and an omitted screen, WebGL, or WebGPU object leave those particular values on Chromium's real results. The seed is still installed, so canvas and audio readback are perturbed for every applied persona.
 
-The apply runs after `session.fromPartition` and before any page. It sets `NetworkContext::SetUserAgent` and `SetAcceptLanguage`, stores `blink::UserAgentMetadata` on the partition, and `WebContents::SetUserAgent` passes that metadata as `ua_metadata_override`. Chromium uses that override for the document user agent, `navigator.userAgentData`, and `Sec-CH-UA*`. `dedicated_worker.cc` at the pin copies `execution_context->UserAgent()` and `GetUserAgentMetadata()` into the worker, so a dedicated worker follows the document. Shared workers (`shared_worker_host.cc`) and service workers (`service_worker_version.cc`) call `ContentBrowserClient::GetUserAgent()` and `GetUserAgentMetadata()`. `patches/chromium/agent_persona_worker_user_agent.patch` adds `OverrideUserAgentForBrowserContext` and calls it with the worker's `BrowserContext`. Electron fills the user agent and metadata from the persona. That patch was checked with `git apply --check` against those three pinned files. It is not compiled.
+The apply runs after `session.fromPartition` and before any page. It sets `NetworkContext::SetUserAgent` and `SetAcceptLanguage`, stores `blink::UserAgentMetadata` on the partition, and `WebContents::SetUserAgent` passes that metadata as `ua_metadata_override`. Chromium uses that override for the document user agent, `navigator.userAgentData`, and `Sec-CH-UA*`. `dedicated_worker.cc` at the pin copies `execution_context->UserAgent()` and `GetUserAgentMetadata()` into the worker, so a dedicated worker follows the document. Shared workers (`shared_worker_host.cc`) and service workers (`service_worker_version.cc`) call `ContentBrowserClient::GetUserAgent()` and `GetUserAgentMetadata()`. `patches/chromium/agent_persona_worker_user_agent.patch` adds `OverrideUserAgentForBrowserContext` and calls it with the worker's `BrowserContext`. Electron fills the user agent and metadata from the persona.
 
-Timezone is checked with `icu::TimeZone::createTimeZone` in the browser and is not installed as the browser-process default. Renderer processes for that partition receive `--electron-agent-timezone`, `--electron-agent-hardware-concurrency`, and `--electron-agent-device-memory`. `RendererClientBase::RenderThreadStarted` calls `blink::TimeZoneController::SetTimeZoneOverride` and keeps the returned handle so the destructor does not clear it. The controller notifies V8 and worker threads in that process. A spare renderer is refused for a persona partition because it would have been launched without those switches.
+Timezone is checked with `icu::TimeZone::createTimeZone` in the browser and is not installed as the browser-process default. Renderer processes for that partition receive the persona command-line switches from `AppendExtraCommandLineSwitches`. `RendererClientBase::RenderThreadStarted` calls `blink::TimeZoneController::SetTimeZoneOverride` and keeps the returned handle so the destructor does not clear it. The controller notifies V8 and worker threads in that process.
 
-`hardwareConcurrency` and `deviceMemory` are read in Blink from those switches by `patches/chromium/agent_persona_renderer_hardware_overrides.patch`. The patch was checked with `git apply --check` against the Chromium `159.0.8140.0` copies of `navigator_concurrent_hardware.cc` and `navigator_device_memory.cc`. It does not call `SysInfo` when the switch is present, and it does not call `SetPhysicalMemoryMBForTesting`. Timezone and accept language use APIs already in this tree, so they were not patch-checked. HTTP `User-Agent` uses the existing `NetworkContext::SetUserAgent`. The worker user-agent patch is the second persona patch.
+A spare renderer is refused for a persona partition because it would have been launched without those switches. Chromium `159.0.8140.0` `SpareProcessRefusedByEmbedderReason` is `DefaultDisabled`, `NoProfile`, `TopFrameChromeWebUI`, `InstantRendererForNewTabPage`, `ExtensionProcess`, `JitDisabled`, `V8OptimizationsDisabled`, or `DisallowV8FeatureFlagOverrides`. None of those name a persona. The refusal uses `DefaultDisabled`, the same general embedder value this method already uses when spares are turned off. Adding an enum value would also require a metrics XML change, and no existing bucket is more accurate.
 
-Reusing an open partition with a different persona id throws `partition-conflict`. The native side also rejects a second id and rejects an apply after a page exists.
+Renderer switches, present only when that field is set:
+
+*   `--electron-agent-timezone`
+*   `--electron-agent-hardware-concurrency`
+*   `--electron-agent-device-memory`
+*   `--electron-agent-screen`, six comma-separated numbers: width, height, availWidth, availHeight, colorDepth, deviceScaleFactor
+*   `--electron-agent-webgl-vendor` and `--electron-agent-webgl-renderer`
+*   `--electron-agent-webgpu-vendor`, `--electron-agent-webgpu-architecture`, `--electron-agent-webgpu-device`, and `--electron-agent-webgpu-description`
+*   `--electron-agent-canvas-seed` and `--electron-agent-audio-seed`, both the persona seed
+
+`hardwareConcurrency` and `deviceMemory` are read in Blink by `patches/chromium/agent_persona_renderer_hardware_overrides.patch`. Screen metrics are read by `patches/chromium/agent_persona_screen_metrics.patch`. `Screen::GetRect` and `Screen::colorDepth` use the switch. `MediaValues::CalculateDeviceWidth` and `CalculateDeviceHeight` use the same width and height, including the physical-pixel quirk, so `matchMedia` `device-width` and `device-height` follow `screen.width` and `screen.height`. `window.devicePixelRatio` returns the persona scale. `LocalFrame::DevicePixelRatio` and `MediaValues::CalculateDevicePixelRatio` stay on the real scale, so layout, canvas backing-store scale, offscreen rendering, and `matchMedia` `(resolution)` are not rewritten. `matchMedia` `(color)` still reads `depth_per_component`, not `screen.colorDepth`.
+
+WebGL and WebGPU identifiers are `patches/chromium/agent_persona_webgl_webgpu_identifiers.patch`. `WebGLRenderingContextBase::getParameter` returns the persona vendor for both `GL_VENDOR` and `UNMASKED_VENDOR_WEBGL`, and the persona renderer for both `GL_RENDERER` and `UNMASKED_RENDERER_WEBGL`. The extension-disabled error path is unchanged. `GPUAdapterInfo` overrides vendor, architecture, device, and description. `subgroupMinSize` and the other limit getters stay on the real adapter.
+
+Canvas readback is `patches/chromium/agent_persona_canvas_readback.patch`. `ImageDataBuffer::EncodeImage` and `ToDataURL` copy the pixmap and perturb the copy. The software `peekPixels` path aliases the displayed bitmap, so that memory is not written. `HTMLCanvasElement` `toDataURL` uses `ToDataURL`. `toBlob` and OffscreenCanvas `convertToBlob` both reach `CanvasAsyncBlobCreator::EncodeImage`, which calls `ImageDataBuffer::EncodeImage`. `getImageData` perturbs the new `ImageData` after `readPixels`, including the context-lost and out-of-bounds buffers. `putImageData` is a display write and is not perturbed. Every 64th byte moves by one and wraps at 0 and 255. The change is a function of the seed, the index, and the original byte.
+
+Audio readback is `patches/chromium/agent_persona_audio_readback.patch`. `OfflineAudioContext::OnChunkRendered` perturbs the result once, before `Resolve`, through `getChannelData`. Later `getChannelData` and `copyFromChannel` see that same channel. Live `AudioBuffer` objects are not perturbed on every read. `AnalyserNode` perturbs the array returned by `getFloatFrequencyData`, `getByteFrequencyData`, `getFloatTimeDomainData`, and `getByteTimeDomainData` after the handler fills it. Float samples move by `1e-7`. Byte samples move by one. The analyser node itself is not modified.
+
+WebRTC has no Chromium patch. `ElectronBrowserClient::OverrideWebPreferences` writes `blink::RendererPreferences::webrtc_ip_handling_policy` from the persona after the guest preference override, so a page created later still receives it. `WebContents::InitWithSessionAndOptions` calls the existing `SetWebRTCIPHandlingPolicy` after `accept_languages` is assigned. `default` and an empty policy skip both writes.
+
+Dedicated workers share the document renderer, so they see the same switches. Shared-worker and service-worker processes are renderer processes of the same `BrowserContext`, and `AppendExtraCommandLineSwitches` adds the switches when that process is created after the persona. Workers do not have `window.screen`. WebRTC preferences are per `WebContents`, not a worker command line.
+
+`fontPolicy: "core"` stays rejected. Blink selects fonts through the host stack: fontconfig on Linux, DirectWrite on Windows, and CoreText on macOS. Chromium 159 has no per-renderer switch that limits every platform to one shared core set. Bundling a font set, or depending on whichever core fonts the host happens to have, would change text layout and would not be the same set on Linux, Windows, and macOS. The error string is `fontPolicy 'core' is not implemented on this platform and is rejected`.
 
 ## Explicitly not implemented
 
 The following stay out of this checkpoint.
 
-*   Screen metrics, WebGL unmasked vendor/renderer, WebGPU adapter info, seeded canvas readback, audio readback perturbation, and WebRTC IP policy.
-*   `fontPolicy: "core"`. No platform font allowlist is installed, so the value is rejected.
+*   `fontPolicy: "core"`, for the reason above.
+*   Rewriting `matchMedia` `(resolution)` or `matchMedia` `(color)` to the persona scale and color depth. Those queries stay on the values layout already uses.
 *   Finch, Widevine spoofing, and TLS or JA3 changes. None of those are part of the persona.
 *   Any claim that a persona is undetectable, or that codecs and Widevine are something other than what this build actually contains.
 *   A compiled or runtime-executed proof of the accessibility snapshot, the response-body tee, the WebSocket forwarder, or the persona apply. All of them are source implementations.
@@ -177,7 +197,7 @@ Not run for this checkpoint, and not claimed:
 *   `e sync`, `gclient`, or a Chromium checkout. The WebSocket contracts were read from the public Chromium `159.0.8140.0` sources for `websocket.mojom`, `services/network/websocket.cc`, `net/websockets/websocket_channel.cc`, `net/websockets/websocket_deflate_stream.h`, `content/browser/websockets/websocket_connector_impl.cc`, and Blink `websocket_channel_impl.cc`. That reading is not a runtime proof.
 *   `e build` or any full Electron build
 *   `e test` or vitest under Electron
-*   `script/gen-filenames.mts`. Running it here would drop `node_header_sources`, because `../third_party/electron_node` and `../v8` are not checked out. `agent-persona.md`, `agent-persona-apply.md`, and `agent-persona-screen.md` were inserted into `filenames.auto.gni` in sorted order by hand. No new C++ file was added.
+*   `script/gen-filenames.mts`. Running it here would drop `node_header_sources`, because `../third_party/electron_node` and `../v8` are not checked out. `agent-persona.md`, `agent-persona-apply.md`, `agent-persona-screen.md`, `agent-persona-webgl.md`, and `agent-persona-webgpu.md` were inserted into `filenames.auto.gni` in sorted order by hand. No new C++ file was added.
 
 `docs/api-history.schema.json` accepts `https://github.com/oceanDeep512/electron/pull/1` in addition to `electron/electron` pull requests. The history blocks use that fork pull request. No `electron/electron` pull request number was invented.
 
@@ -185,13 +205,24 @@ This checkpoint ran:
 
 *   `node --experimental-strip-types --test spec/agent-runtime-logic.test.ts` — exit 0, 21 passed, 0 failed. Node prints `MODULE_TYPELESS_PACKAGE_JSON`. The test covers the persona decision. It does not execute C++.
 *   `node node_modules/typescript/lib/tsc.js -p tsconfig.agent-runtime-logic.json --pretty false --noEmit` — exit 0.
-*   `node node_modules/typescript/lib/tsc.js -p tsconfig.script.json --pretty false --noEmit` — exit 0, 0 errors. No `agent-runtime` path and no `TS1287`.
+*   `node node_modules/typescript/lib/tsc.js -p tsconfig.script.json --pretty false --noEmit` — exit 0, no diagnostics.
 *   `node --experimental-strip-types --check` on the logic module, the runtime module, the logic test, and `spec/api-agent-runtime.spec.ts` — exit 0. That is syntax only.
-*   `node script/create-api-json.mjs` — exit 0. `node node_modules/@electron/typescript-definitions/dist/bin.js --api=electron-api.json` — exit 0. `nativePersona` is an object, and `setAgentPersona` is in the generated JSON and `electron.d.ts`. Those generated files are gitignored.
+*   `node script/create-api-json.mjs` — exit 0. `node node_modules/@electron/typescript-definitions/dist/bin.js --api=electron-api.json` — exit 0. `nativePersona` is an object, and `setAgentPersona` includes the screen, WebGL, WebGPU, seed, and WebRTC fields in the generated JSON and `electron.d.ts`. Those generated files are gitignored.
 *   `node spec/ts-smoke/runner.js` — exit 0.
 *   `node node_modules/typescript/lib/tsc.js -p tsconfig.electron.json --pretty false --noEmit` — exit 1, ten errors, all missing `@node/...` because `../third_party/electron_node` is not checked out. No error names an agent runtime file.
-*   `node node_modules/typescript/lib/tsc.js -p tsconfig.spec.json --pretty false --noEmit` — exit 0, 0 errors. `spec/api-agent-runtime.spec.ts` typechecks. It was not executed.
+*   `node node_modules/typescript/lib/tsc.js -p tsconfig.spec.json --pretty false --noEmit` — exit 0, no diagnostics. `spec/api-agent-runtime.spec.ts` typechecks. It was not executed.
 *   `node node_modules/@electron/lint-roller/dist/bin/lint-markdown-api-history.js` with the repo's history arguments — exit 0, 134 blocks, 0 errors, 1 pre-existing warning in `crash-reporter.md`.
-*   `git apply --check` for `agent_persona_renderer_hardware_overrides.patch` against the pinned `navigator_concurrent_hardware.cc` and `navigator_device_memory.cc` — exit 0. `git apply --check` for `agent_persona_worker_user_agent.patch` against the pinned `service_worker_version.cc`, `shared_worker_host.cc`, and `content_browser_client.h` — exit 0. No other persona patch was checked, because timezone, accept language, and HTTP user agent use APIs already in this tree.
+*   `git apply --check` for `agent_persona_screen_metrics.patch`, `agent_persona_webgl_webgpu_identifiers.patch`, `agent_persona_canvas_readback.patch`, and `agent_persona_audio_readback.patch` — exit 0 for each. The check used sparse copies of the touched Chromium `159.0.8140.0` files. It was not a full tree and not a compile. WebRTC and `fontPolicy: "core"` have no patch. Timezone, accept language, and HTTP user agent use APIs already in this tree.
 
-oxlint is not installed in this environment. clang-format is not installed. `e build` and `e test` were not run. The C++ persona apply, the two Chromium patches, the response-body tee, the WebSocket forwarder, and the accessibility snapshot binding are source only. `spec/api-agent-runtime.spec.ts` was not executed.
+The earlier `agent_persona_renderer_hardware_overrides.patch` and `agent_persona_worker_user_agent.patch` were apply-checked in the previous persona commit. They were not apply-checked again in this run.
+
+oxlint is not installed in this environment. clang-format is not installed. `e build` and `e test` were not run. The C++ persona apply, the Chromium patches, the response-body tee, the WebSocket forwarder, and the accessibility snapshot binding are source only. `spec/api-agent-runtime.spec.ts` was not executed.
+
+## What remains before this v1 is source-complete
+
+The control plane, navigation and input, accessibility snapshot, HTTP body observation, page WebSocket observation, and the persona surfaces below now have source. That source is not compiled. The items still missing from the written v1 are:
+
+*   `fontPolicy: "core"`. It is rejected. There is no core-font implementation.
+*   `matchMedia` `(resolution)` and `(color)` still read the real frame scale and component depth. `device-width` and `device-height` follow the persona screen.
+*   WebSocket observation still does not include shared workers, service workers, `net.WebSocket`, or a connection taken by the extensions WebSocket proxy.
+*   A Chromium tree with these patches applied and compiled, and an Electron binary that runs `spec/api-agent-runtime.spec.ts`. Those are the verification steps that are still absent. They are not another unwritten surface.

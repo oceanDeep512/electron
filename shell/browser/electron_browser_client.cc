@@ -35,6 +35,7 @@
 #include "chrome/common/chrome_switches.h"
 #include "chrome/common/chrome_version.h"
 #include "components/embedder_support/user_agent_utils.h"
+#include "third_party/blink/public/common/peerconnection/webrtc_ip_handling_policy.h"
 #include "components/net_log/chrome_net_log.h"
 #include "components/network_hints/common/network_hints.mojom.h"
 #include "content/browser/keyboard_lock/keyboard_lock_service_impl.h"  // nogncheck
@@ -532,6 +533,20 @@ void ElectronBrowserClient::OverrideWebPreferences(
   if (auto* web_preferences = WebContentsPreferences::From(web_contents)) {
     web_preferences->OverrideWebkitPrefs(prefs, renderer_prefs);
   }
+
+  // Every WebContents for a persona partition, including ones created later,
+  // gets the session WebRTC policy. Chromium calls this hook when preferences
+  // are built and again when they are refreshed.
+  auto* persona_context = static_cast<ElectronBrowserContext*>(
+      web_contents->GetBrowserContext());
+  if (persona_context) {
+    const auto* persona = persona_context->agent_persona();
+    if (persona && !persona->webrtc_ip_handling_policy.empty() &&
+        persona->webrtc_ip_handling_policy != "default") {
+      renderer_prefs->webrtc_ip_handling_policy =
+          blink::ToWebRTCIPHandlingPolicy(persona->webrtc_ip_handling_policy);
+    }
+  }
 }
 
 bool ElectronBrowserClient::WebPreferencesNeedUpdateForColorRelatedStateChanges(
@@ -702,6 +717,38 @@ void ElectronBrowserClient::AppendExtraCommandLineSwitches(
                                         persona->device_memory);
         command_line->AppendSwitchASCII(switches::kAgentTimezone,
                                         persona->timezone);
+        if (!persona->seed.empty()) {
+          command_line->AppendSwitchASCII(switches::kAgentCanvasSeed,
+                                          persona->seed);
+          command_line->AppendSwitchASCII(switches::kAgentAudioSeed,
+                                          persona->seed);
+        }
+        if (persona->screen_width > 0) {
+          command_line->AppendSwitchASCII(
+              switches::kAgentScreen,
+              base::NumberToString(persona->screen_width) + "," +
+                  base::NumberToString(persona->screen_height) + "," +
+                  base::NumberToString(persona->screen_avail_width) + "," +
+                  base::NumberToString(persona->screen_avail_height) + "," +
+                  base::NumberToString(persona->screen_color_depth) + "," +
+                  base::NumberToString(persona->screen_device_scale_factor));
+        }
+        if (!persona->webgl_vendor.empty()) {
+          command_line->AppendSwitchASCII(switches::kAgentWebGLVendor,
+                                          persona->webgl_vendor);
+          command_line->AppendSwitchASCII(switches::kAgentWebGLRenderer,
+                                          persona->webgl_renderer);
+        }
+        if (!persona->webgpu_vendor.empty()) {
+          command_line->AppendSwitchASCII(switches::kAgentWebGPUVendor,
+                                          persona->webgpu_vendor);
+          command_line->AppendSwitchASCII(switches::kAgentWebGPUArchitecture,
+                                          persona->webgpu_architecture);
+          command_line->AppendSwitchASCII(switches::kAgentWebGPUDevice,
+                                          persona->webgpu_device);
+          command_line->AppendSwitchASCII(switches::kAgentWebGPUDescription,
+                                          persona->webgpu_description);
+        }
       }
     }
     content::WebContents* web_contents =
@@ -2087,7 +2134,12 @@ bool ElectronBrowserClient::ShouldUseSpareRenderProcessHost(
         content::ContentBrowserClient::SpareProcessRefusedByEmbedderReason>&
         refused_reason) {
   // A spare renderer is launched before it is bound to a persona, so it would
-  // miss the timezone and hardware switches.
+  // miss the renderer switches. Chromium 159.0.8140.0's
+  // SpareProcessRefusedByEmbedderReason is DefaultDisabled, NoProfile,
+  // TopFrameChromeWebUI, InstantRendererForNewTabPage, ExtensionProcess,
+  // JitDisabled, V8OptimizationsDisabled, or DisallowV8FeatureFlagOverrides.
+  // None of those name a persona. DefaultDisabled is the general embedder
+  // refusal, the same value this method uses when spares are turned off.
   if (browser_context) {
     auto* persona_context =
         static_cast<ElectronBrowserContext*>(browser_context);

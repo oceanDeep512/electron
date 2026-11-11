@@ -89,6 +89,8 @@ auto_filenames = {
     "docs/api/structures/agent-accessibility-node.md",
     "docs/api/structures/agent-persona-apply.md",
     "docs/api/structures/agent-persona-screen.md",
+    "docs/api/structures/agent-persona-webgl.md",
+    "docs/api/structures/agent-persona-webgpu.md",
     "docs/api/structures/agent-persona.md",
     "docs/api/structures/base-window-options.md",
     "docs/api/structures/bluetooth-device.md",

@@ -2092,6 +2092,13 @@ void WebContents::InitWithSessionAndOptions(
       accept_languages = persona->accept_languages;
   }
   prefs->accept_languages = accept_languages;
+  if (const auto* persona = browser_context->agent_persona()) {
+    if (!persona->webrtc_ip_handling_policy.empty() &&
+        persona->webrtc_ip_handling_policy != "default" &&
+        GetWebRTCIPHandlingPolicy() != persona->webrtc_ip_handling_policy) {
+      SetWebRTCIPHandlingPolicy(persona->webrtc_ip_handling_policy);
+    }
+  }
 
 #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_WIN)
   // Update font settings.

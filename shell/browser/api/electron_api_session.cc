@@ -1417,6 +1417,7 @@ void Session::SetAgentPersona(gin::Arguments* args) {
   }
   ElectronBrowserContext::AgentPersona persona;
   if (!options.Get("id", &persona.id) || persona.id.empty() ||
+      !options.Get("seed", &persona.seed) || persona.seed.empty() ||
       !options.Get("userAgent", &persona.user_agent) ||
       persona.user_agent.empty() ||
       !options.Get("acceptLanguages", &persona.accept_languages) ||
@@ -1461,6 +1462,46 @@ void Session::SetAgentPersona(gin::Arguments* args) {
     args->ThrowTypeError(error.empty() ? "brand list is invalid" : error);
     return;
   }
+  gin_helper::Dictionary screen;
+  if (options.Get("screen", &screen)) {
+    if (!screen.Get("width", &persona.screen_width) ||
+        !screen.Get("height", &persona.screen_height) ||
+        !screen.Get("availWidth", &persona.screen_avail_width) ||
+        !screen.Get("availHeight", &persona.screen_avail_height) ||
+        !screen.Get("colorDepth", &persona.screen_color_depth) ||
+        !screen.Get("deviceScaleFactor", &persona.screen_device_scale_factor) ||
+        persona.screen_width < 1 || persona.screen_height < 1 ||
+        persona.screen_avail_width < 1 || persona.screen_avail_height < 1 ||
+        persona.screen_device_scale_factor <= 0) {
+      args->ThrowTypeError("screen metrics are invalid");
+      return;
+    }
+  }
+  gin_helper::Dictionary webgl;
+  if (options.Get("webgl", &webgl)) {
+    if (!webgl.Get("vendor", &persona.webgl_vendor) ||
+        persona.webgl_vendor.empty() ||
+        !webgl.Get("renderer", &persona.webgl_renderer) ||
+        persona.webgl_renderer.empty()) {
+      args->ThrowTypeError("webgl vendor and renderer are required");
+      return;
+    }
+  }
+  gin_helper::Dictionary webgpu;
+  if (options.Get("webgpu", &webgpu)) {
+    if (!webgpu.Get("vendor", &persona.webgpu_vendor) ||
+        persona.webgpu_vendor.empty() ||
+        !webgpu.Get("architecture", &persona.webgpu_architecture) ||
+        persona.webgpu_architecture.empty() ||
+        !webgpu.Get("device", &persona.webgpu_device) ||
+        persona.webgpu_device.empty() ||
+        !webgpu.Get("description", &persona.webgpu_description) ||
+        persona.webgpu_description.empty()) {
+      args->ThrowTypeError("webgpu adapter identifiers are required");
+      return;
+    }
+  }
+  options.Get("webrtcIpHandlingPolicy", &persona.webrtc_ip_handling_policy);
   error = browser_context_->ApplyAgentPersona(std::move(persona));
   if (!error.empty())
     args->ThrowTypeError(error);
