@@ -11,6 +11,7 @@
 
 #include "base/containers/span.h"
 #include "base/functional/bind.h"
+#include "base/functional/callback.h"
 #include "base/memory/scoped_refptr.h"
 #include "base/strings/string_number_conversions.h"
 #include "base/strings/string_util.h"
@@ -231,15 +232,21 @@ class WebSocketMessageForwarder
     options.flags = MOJO_CREATE_DATA_PIPE_FLAG_NONE;
     options.element_num_bytes = 1;
     options.capacity_num_bytes = kPipeCapacity;
-    mojo::CreateDataPipe(&options, renderer_outgoing_producer_,
-                         renderer_outgoing_);
-    mojo::CreateDataPipe(&options, renderer_incoming_producer_,
-                         renderer_incoming_);
+    const MojoResult outgoing_result = mojo::CreateDataPipe(
+        &options, renderer_outgoing_producer_, renderer_outgoing_);
+    const MojoResult incoming_result = mojo::CreateDataPipe(
+        &options, renderer_incoming_producer_, renderer_incoming_);
+    // A failed create can leave a handle unset. Both the result and the
+    // handles have to agree before Start() watches them.
+    pipes_created_ = outgoing_result == MOJO_RESULT_OK &&
+                     incoming_result == MOJO_RESULT_OK &&
+                     renderer_outgoing_producer_.is_valid() &&
+                     renderer_outgoing_.is_valid() &&
+                     renderer_incoming_producer_.is_valid() &&
+                     renderer_incoming_.is_valid();
   }
 
-  bool pipes_ok() const {
-    return renderer_outgoing_ && renderer_incoming_producer_;
-  }
+  bool pipes_ok() const { return pipes_created_; }
 
   mojo::PendingRemote<network::mojom::WebSocket> TakeSocket() {
     return std::move(renderer_socket_);
@@ -274,22 +281,28 @@ class WebSocketMessageForwarder
         &WebSocketMessageForwarder::OnRendererGone, weak_factory_.GetWeakPtr()));
     renderer_client_.set_disconnect_handler(base::BindOnce(
         &WebSocketMessageForwarder::OnRendererGone, weak_factory_.GetWeakPtr()));
-    incoming_readable_.Watch(
-        incoming_.get(), MOJO_HANDLE_SIGNAL_READABLE,
-        base::BindRepeating(&WebSocketMessageForwarder::OnIncomingReadable,
-                            weak_factory_.GetWeakPtr()));
-    incoming_writable_.Watch(
-        renderer_incoming_producer_.get(), MOJO_HANDLE_SIGNAL_WRITABLE,
-        base::BindRepeating(&WebSocketMessageForwarder::OnIncomingWritable,
-                            weak_factory_.GetWeakPtr()));
-    outgoing_readable_.Watch(
-        renderer_outgoing_.get(), MOJO_HANDLE_SIGNAL_READABLE,
-        base::BindRepeating(&WebSocketMessageForwarder::OnOutgoingReadable,
-                            weak_factory_.GetWeakPtr()));
-    outgoing_writable_.Watch(
-        outgoing_.get(), MOJO_HANDLE_SIGNAL_WRITABLE,
-        base::BindRepeating(&WebSocketMessageForwarder::OnOutgoingWritable,
-                            weak_factory_.GetWeakPtr()));
+    // Same Watch contract as net.WebSocket: a bad handle is a programming
+    // error after pipes_ok(), and the result is checked rather than ignored.
+    CHECK_EQ(incoming_readable_.Watch(
+                 incoming_.get(), MOJO_HANDLE_SIGNAL_READABLE,
+                 base::BindRepeating(&WebSocketMessageForwarder::OnIncomingReadable,
+                                     weak_factory_.GetWeakPtr())),
+             MOJO_RESULT_OK);
+    CHECK_EQ(incoming_writable_.Watch(
+                 renderer_incoming_producer_.get(), MOJO_HANDLE_SIGNAL_WRITABLE,
+                 base::BindRepeating(&WebSocketMessageForwarder::OnIncomingWritable,
+                                     weak_factory_.GetWeakPtr())),
+             MOJO_RESULT_OK);
+    CHECK_EQ(outgoing_readable_.Watch(
+                 renderer_outgoing_.get(), MOJO_HANDLE_SIGNAL_READABLE,
+                 base::BindRepeating(&WebSocketMessageForwarder::OnOutgoingReadable,
+                                     weak_factory_.GetWeakPtr())),
+             MOJO_RESULT_OK);
+    CHECK_EQ(outgoing_writable_.Watch(
+                 outgoing_.get(), MOJO_HANDLE_SIGNAL_WRITABLE,
+                 base::BindRepeating(&WebSocketMessageForwarder::OnOutgoingWritable,
+                                     weak_factory_.GetWeakPtr())),
+             MOJO_RESULT_OK);
   }
 
   void SendMessage(network::mojom::WebSocketMessageType type,
@@ -303,7 +316,11 @@ class WebSocketMessageForwarder
     // drained and forwarded. Those bytes are not assembled into an event.
     const bool observe =
         type != network::mojom::WebSocketMessageType::CONTINUATION;
+    // At most one unread data frame. The renderer writes the bytes after
+    // SendMessage, so the next message stays paused until those bytes have
+    // been copied onto the network pipe. The frame is never dropped.
     outgoing_frames_.push_back(FrameExpect{true, observe, type, data_length});
+    HoldOutgoing();
     PumpOutgoing();
   }
 
@@ -327,7 +344,11 @@ class WebSocketMessageForwarder
       return;
     if (renderer_client_)
       renderer_client_->OnDataFrame(fin, type, data_length);
+    // Same pause as net::WebSocket in this tree: accept this frame, then stop
+    // the message pipe until its bytes have been forwarded. A later frame
+    // stays in the Mojo pipe instead of growing an unbounded deque.
     incoming_frames_.push_back(FrameExpect{fin, true, type, data_length});
+    HoldIncoming();
     PumpIncoming();
   }
 
@@ -406,6 +427,69 @@ class WebSocketMessageForwarder
   void OnRendererGone() {
     scoped_refptr<WebSocketMessageForwarder> keep(this);
     Fail(net::ERR_ABORTED);
+  }
+
+  // Pause the message pipe while one data frame's bytes are still outstanding.
+  // Zero-length frames finish inside Pump and do not pause. Resume is posted
+  // so a burst of already-buffered frames cannot nest Mojo dispatch on this
+  // stack. The data pipes stay armed: backpressure is the unread message, not
+  // a dropped length.
+  void HoldIncoming() {
+    if (shut_ || incoming_paused_ || incoming_frames_.empty() ||
+        incoming_frames_.front().remaining == 0) {
+      return;
+    }
+    incoming_paused_ = true;
+    network_client_.Pause();
+  }
+
+  void HoldOutgoing() {
+    if (shut_ || outgoing_paused_ || outgoing_frames_.empty() ||
+        outgoing_frames_.front().remaining == 0 || !renderer_socket_receiver_) {
+      return;
+    }
+    outgoing_paused_ = true;
+    renderer_socket_receiver_->Pause();
+  }
+
+  void ScheduleResumeIncoming() {
+    if (shut_ || !incoming_paused_ || incoming_resume_posted_ ||
+        !incoming_frames_.empty()) {
+      return;
+    }
+    incoming_resume_posted_ = true;
+    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
+        FROM_HERE, base::BindOnce(&WebSocketMessageForwarder::ResumeIncoming,
+                                  weak_factory_.GetWeakPtr()));
+  }
+
+  void ScheduleResumeOutgoing() {
+    if (shut_ || !outgoing_paused_ || outgoing_resume_posted_ ||
+        !outgoing_frames_.empty()) {
+      return;
+    }
+    outgoing_resume_posted_ = true;
+    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
+        FROM_HERE, base::BindOnce(&WebSocketMessageForwarder::ResumeOutgoing,
+                                  weak_factory_.GetWeakPtr()));
+  }
+
+  void ResumeIncoming() {
+    incoming_resume_posted_ = false;
+    if (shut_ || !incoming_paused_ || !incoming_frames_.empty())
+      return;
+    incoming_paused_ = false;
+    network_client_.Resume();
+  }
+
+  void ResumeOutgoing() {
+    outgoing_resume_posted_ = false;
+    if (shut_ || !outgoing_paused_ || !outgoing_frames_.empty() ||
+        !renderer_socket_receiver_) {
+      return;
+    }
+    outgoing_paused_ = false;
+    renderer_socket_receiver_->Resume();
   }
 
   void PumpIncoming() {
@@ -544,6 +628,8 @@ class WebSocketMessageForwarder
       incoming_message_.clear();
       incoming_truncated_ = false;
     }
+    if (incoming_frames_.empty())
+      ScheduleResumeIncoming();
   }
 
   void FinishOutgoingFrame() {
@@ -566,6 +652,8 @@ class WebSocketMessageForwarder
     outgoing_started_ = false;
     outgoing_message_.clear();
     outgoing_truncated_ = false;
+    if (outgoing_frames_.empty())
+      ScheduleResumeOutgoing();
   }
 
   void Remember(std::vector<uint8_t>& message,
@@ -651,6 +739,12 @@ class WebSocketMessageForwarder
     if (shut_)
       return;
     shut_ = true;
+    // Match net.WebSocket::Teardown and ResponseBodyTee: cancel watchers
+    // while the forwarder is still alive, then drop Mojo endpoints. A watcher
+    // callback holds its own scoped_refptr, so self_.reset() cannot delete
+    // this object until that callback returns. Posted Resume tasks use
+    // WeakPtr and see shut_ if the object is still alive, or are cancelled
+    // when weak_factory_ is destroyed (it is the last member).
     incoming_readable_.Cancel();
     incoming_writable_.Cancel();
     outgoing_readable_.Cancel();
@@ -676,23 +770,36 @@ class WebSocketMessageForwarder
       DropCapture();
     }
     network_socket_.reset();
+    network_client_.set_disconnect_handler(base::DoNothing());
     network_client_.reset();
+    renderer_client_.set_disconnect_handler(base::DoNothing());
     renderer_client_.reset();
-    if (renderer_socket_receiver_)
+    if (renderer_socket_receiver_) {
+      renderer_socket_receiver_->set_disconnect_handler(base::DoNothing());
       renderer_socket_receiver_->reset();
+    }
     incoming_.reset();
     outgoing_.reset();
     renderer_incoming_producer_.reset();
     renderer_outgoing_.reset();
+    incoming_frames_.clear();
+    outgoing_frames_.clear();
+    incoming_pending_.clear();
+    outgoing_pending_.clear();
     self_.reset();
   }
 
   scoped_refptr<InterceptState> state_;
   WebSocketTicket ticket_;
   bool wire_compressed_ = false;
+  bool pipes_created_ = false;
   bool capturing_ = true;
   bool claim_open_ = true;
   bool shut_ = false;
+  bool incoming_paused_ = false;
+  bool outgoing_paused_ = false;
+  bool incoming_resume_posted_ = false;
+  bool outgoing_resume_posted_ = false;
   uint64_t next_message_ = 0;
   mojo::Remote<network::mojom::WebSocket> network_socket_;
   mojo::Receiver<network::mojom::WebSocketClient> network_client_;

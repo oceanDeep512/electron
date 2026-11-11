@@ -789,6 +789,9 @@ function openSocketScript(url: string, replyCount: number): string {
 describe('agentRuntime websocket messages', () => {
   // permessage-deflate is not produced by this fixture. The development page
   // records the pinned-source reading that observed bytes are logical payload.
+  // The native forwarder pauses the Mojo message pipe after one unread data
+  // frame, so a slow consumer stops upstream metadata instead of dropping it.
+  // That pause is source-only and is not exercised here.
 
   it('rejects an invalid message limit before any socket', () => {
     const runtimeSession = createSession();
