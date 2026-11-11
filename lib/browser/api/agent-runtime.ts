@@ -139,6 +139,7 @@ interface NativeResponseSession {
     webgl?: Persona['webgl'];
     webgpu?: Persona['webgpu'];
     webrtcIpHandlingPolicy?: Persona['webrtcIpHandlingPolicy'];
+    fontPolicy?: Persona['fontPolicy'];
     brands: { brand: string; version: string }[];
     fullVersionList: { brand: string; version: string }[];
     fullVersion: string;
@@ -933,6 +934,7 @@ function nativePersonaPayload(persona: Persona) {
     ...(persona.webgl ? { webgl: persona.webgl } : {}),
     ...(persona.webgpu ? { webgpu: persona.webgpu } : {}),
     webrtcIpHandlingPolicy: persona.webrtcIpHandlingPolicy,
+    fontPolicy: persona.fontPolicy,
     acceptLanguages: persona.acceptLanguages.join(','),
     timezone: persona.timezone,
     hardwareConcurrency: persona.hardwareConcurrency,
@@ -954,11 +956,7 @@ function nativePersonaPayload(persona: Persona) {
 function createSession(options: { partition: unknown; persist?: unknown; persona?: unknown }): SessionApi {
   const decision = decidePersona(options.persona);
   if (decision.action === 'invalid') {
-    const fontRejected = decision.errors.some((error) => error.includes("fontPolicy 'core'"));
-    throw failure(
-      fontRejected ? 'font-policy-unavailable' : 'invalid-persona',
-      decision.errors.join('; ')
-    );
+    throw failure('invalid-persona', decision.errors.join('; '));
   }
   if (decision.action === 'unavailable') {
     throw failure(

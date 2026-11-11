@@ -12,6 +12,8 @@ changes:
     description: "Applied screen, graphics identifiers, canvas and audio readback, and WebRTC persona surfaces."
   - pr-url: https://github.com/oceanDeep512/electron/pull/1
     description: "Matched resolution and color media queries to the persona screen."
+  - pr-url: https://github.com/oceanDeep512/electron/pull/1
+    description: "Limited fontPolicy core to a fixed family set and added optional screen HDR and color-index."
 ```
 -->
 
@@ -61,13 +63,13 @@ An `Object` frozen record of the pinned baseline and which stages are present in
   * `timezone` boolean - `true` for that session's renderer processes, including their workers.
   * `hardwareConcurrency` boolean
   * `deviceMemory` boolean
-  * `screen` boolean - `true` for `screen` metrics, `device-width` and `device-height`, `resolution` and prefixed device-pixel-ratio media, `window.devicePixelRatio`, and the CSS `color` feature derived from `colorDepth`. Layout and offscreen rendering keep the real scale.
+  * `screen` boolean - `true` for `screen` metrics, `device-width` and `device-height`, `resolution` and prefixed device-pixel-ratio media, `window.devicePixelRatio`, and the CSS `color` feature derived from `colorDepth`. Optional `colorIndex` and `highDynamicRange` drive `color-index` and `dynamic-range`. Layout and offscreen rendering keep the real scale.
   * `webgl` boolean - `true` for `GL_VENDOR`, `GL_RENDERER`, and the unmasked vendor and renderer strings.
   * `webgpu` boolean - `true` for adapter vendor, architecture, device, and description. Adapter limits stay real.
   * `canvas` boolean - `true` for seeded readback perturbation. The displayed bitmap is not changed.
   * `audio` boolean - `true` for a seeded perturbation of an `OfflineAudioContext` result and `AnalyserNode` readings.
   * `webrtc` boolean - `true`. `default` leaves Chromium's policy. The other accepted policies are written to each page's renderer preferences.
-  * `fonts` boolean - `false`. `fontPolicy: "core"` is rejected.
+  * `fonts` boolean - `true`. `fontPolicy: "core"` limits named fonts to the core set.
 * `accessibilitySnapshot` boolean - `true` when `page.snapshot()` is wired to `WebContents::RequestAXTreeSnapshot`.
 * `responseBodyObservation` boolean - `true` when `session.observeResponses()` is wired to the URL loader tee.
 * `webSocketMessageObservation` boolean - `true` when `session.observeWebSockets()` is wired to the WebSocket forwarder.
@@ -75,7 +77,7 @@ An `Object` frozen record of the pinned baseline and which stages are present in
 ### `agentRuntime.AgentRuntimeError` _Readonly_
 
 An `Error` subclass thrown by this module. `error.code` is a string such as
-`invalid-partition`, `persona-surface-unavailable`, `font-policy-unavailable`, `timeout`, `aborted`,
+`invalid-partition`, `persona-surface-unavailable`, `timeout`, `aborted`,
 `navigation-failed`, or `snapshot-failed`.
 
 ## Methods
@@ -85,7 +87,7 @@ An `Error` subclass thrown by this module. `error.code` is a string such as
 * `options` Object
   * `partition` string - Required partition name. Must not be empty. An empty string is rejected so this method never uses the default session.
   * `persist` boolean (optional) - When omitted, a `persist:` prefix means persistent storage and a bare name means in-memory storage.
-  * `persona` [AgentPersona](structures/agent-persona.md) (optional) - Applies the implemented surfaces before the partition's first renderer or service worker. `null` is invalid. `fontPolicy: "core"` fails with `font-policy-unavailable` and applies nothing. A renderer or service worker that is already running in the partition is rejected.
+  * `persona` [AgentPersona](structures/agent-persona.md) (optional) - Applies the implemented surfaces before the partition's first renderer or service worker. `null` is invalid. `fontPolicy: "core"` limits named fonts to the core set. A renderer or service worker that is already running in the partition is rejected.
 
 Returns [`AgentSession`](agent-runtime.md#class-agentsession)
 
@@ -199,6 +201,8 @@ added:
 changes:
   - pr-url: https://github.com/oceanDeep512/electron/pull/1
     description: "Observed WebSocket messages from shared workers and service workers."
+  - pr-url: https://github.com/oceanDeep512/electron/pull/1
+    description: "Observed net.WebSocket and kept the extension WebSocket proxy when observation is on."
 ```
 -->
 
@@ -216,7 +220,7 @@ Observation is opt-in and session scoped. With no listeners, renderer sockets ar
 
 `body` is the logical message. Incoming frames are the bytes `net::WebSocketChannel` delivered after `WebSocketDeflateStream` inflation. Outgoing bytes are what the renderer wrote before the network service deflates them. `wireCompressed` is true when the handshake extensions include `permessage-deflate`. `text` is set only for a complete, valid UTF-8 text message. A truncated or invalid text message keeps `text` null and still carries the captured bytes. Ping and pong are not events. A redirect-style event is not synthesized.
 
-Pages, dedicated workers, shared workers, and service workers that connect through Chromium's `WebSocketConnector` are observed. A shared or service worker has no frame; the socket is attributed to the `BrowserContext` of its renderer process. `net.WebSocket` in the main process does not use that connector and is not observed. An extension WebSocket proxy is not wrapped. When observation is on, a page socket skips that proxy and uses Electron's forwarder. Handshake failure emits `failed` and no body. A capture limit skips or truncates the copy and does not drop the socket's real frames.
+Pages, dedicated workers, shared workers, and service workers that connect through Chromium's `WebSocketConnector` are observed. A shared or service worker has no frame; the socket is attributed to the `BrowserContext` of its renderer process. `net.WebSocket` uses the same forwarder when it is created with that session. An extension WebSocket proxy still runs for a page socket when observation is on: Electron's forwarder is the outer hop and the extension proxy is the next one. The extension API requires a frame, so a shared or service worker socket is not sent through that proxy. Handshake failure emits `failed` and no body. A capture limit skips or truncates the copy and does not drop the socket's real frames.
 
 #### `session.close()`
 

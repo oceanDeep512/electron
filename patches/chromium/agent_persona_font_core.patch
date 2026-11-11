@@ -1,0 +1,250 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Electron Agent Runtime <agent-runtime@electron.local>
+Date: Wed, 11 Nov 2026 20:20:00 +0000
+Subject: [electron] limit renderer fonts to the core family set
+
+When electron-agent-font-policy=core is present, named families outside
+Arial, Courier New, Georgia, Times New Roman, Trebuchet MS, and Verdana do
+not match. Generic families still use the platform mapping. local() matches
+only those published names. queryLocalFonts drops other families.
+System-wide glyph search is replaced by the last-resort font. Nothing here
+is compiled in this change.
+
+diff --git a/third_party/blink/renderer/platform/fonts/font_cache.cc b/third_party/blink/renderer/platform/fonts/font_cache.cc
+--- a/third_party/blink/renderer/platform/fonts/font_cache.cc
++++ b/third_party/blink/renderer/platform/fonts/font_cache.cc
+@@ -35,6 +35,8 @@
+ #include <memory>
+ 
+ #include "base/byte_size.h"
++#include "base/command_line.h"
++#include "base/strings/string_util.h"
+ #include "base/debug/alias.h"
+ #include "base/feature_list.h"
+ #include "base/notreached.h"
+@@ -79,6 +81,29 @@
+ #endif
+ 
+ namespace blink {
++namespace {
++
++bool AgentFontCoreEnabled() {
++  return base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++             "electron-agent-font-policy") == "core";
++}
++
++bool AgentCoreFontFamily(const String& family) {
++  if (family.empty())
++    return false;
++  // Published core names only. Generic families never reach this helper.
++  // Host metrics still apply when one of these families is installed.
++  const char* const kNames[] = {"arial", "courier new", "georgia",
++                                "times new roman", "trebuchet ms", "verdana"};
++  const std::string folded = base::ToLowerASCII(family.Utf8());
++  for (const char* name : kNames) {
++    if (folded == name)
++      return true;
++  }
++  return false;
++}
++
++}  // namespace
+ 
+ const char kColorEmojiLocale[] = "und-Zsye";
+ const char kMonoEmojiLocale[] = "und-Zsym";
+@@ -178,6 +203,11 @@
+     const FontDescription& font_description,
+     const AtomicString& family,
+     AlternateFontName altername_font_name) {
++  // local() unique-name lookup. Generic resolution uses a different call.
++  if (altername_font_name == AlternateFontName::kLocalUniqueFace &&
++      AgentFontCoreEnabled() && !AgentCoreFontFamily(String(family))) {
++    return nullptr;
++  }
+   if (const FontPlatformData* platform_data = GetFontPlatformData(
+           font_description,
+           FontFaceCreationParams(
+@@ -199,6 +229,8 @@
+ bool FontCache::IsPlatformFamilyMatchAvailable(
+     const FontDescription& font_description,
+     const AtomicString& family) {
++  if (AgentFontCoreEnabled() && !AgentCoreFontFamily(String(family)))
++    return false;
+   return GetFontPlatformData(
+       font_description,
+       FontFaceCreationParams(AdjustFamilyNameToAvoidUnsupportedFonts(family)),
+@@ -212,6 +244,8 @@
+   if (unique_font_name.empty()) {
+     return false;
+   }
++  if (AgentFontCoreEnabled() && !AgentCoreFontFamily(String(unique_font_name)))
++    return false;
+ 
+   return GetFontPlatformData(font_description,
+                              FontFaceCreationParams(unique_font_name),
+@@ -244,6 +278,10 @@
+       unicode::IsNonCharacter(lookup_char)) {
+     return nullptr;
+   }
++  // Do not scan every installed font. One last-resort face still draws the
++  // glyph, so its metrics can differ by operating system.
++  if (AgentFontCoreEnabled())
++    return GetLastResortFallbackFont(description);
+   base::ElapsedTimer timer;
+   const SimpleFontData* result = PlatformFallbackFontForCharacter(
+       description, lookup_char, font_data_to_substitute, fallback_priority);
+diff --git a/third_party/blink/renderer/core/css/css_font_selector.cc b/third_party/blink/renderer/core/css/css_font_selector.cc
+--- a/third_party/blink/renderer/core/css/css_font_selector.cc
++++ b/third_party/blink/renderer/core/css/css_font_selector.cc
+@@ -26,6 +26,8 @@
+ 
+ #include "third_party/blink/renderer/core/css/css_font_selector.h"
+ 
++#include "base/command_line.h"
++#include "base/strings/string_util.h"
+ #include "build/build_config.h"
+ #include "third_party/blink/renderer/core/animation/interpolable_color.h"
+ #include "third_party/blink/renderer/core/css/css_segmented_font_face.h"
+@@ -44,6 +46,29 @@
+ #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+ 
+ namespace blink {
++namespace {
++
++bool AgentFontCoreEnabled() {
++  return base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++             "electron-agent-font-policy") == "core";
++}
++
++bool AgentCoreFontFamily(const String& family) {
++  if (family.empty())
++    return false;
++  // Published core names only. Generic families never reach this helper.
++  // Host metrics still apply when one of these families is installed.
++  const char* const kNames[] = {"arial", "courier new", "georgia",
++                                "times new roman", "trebuchet ms", "verdana"};
++  const std::string folded = base::ToLowerASCII(family.Utf8());
++  for (const char* name : kNames) {
++    if (folded == name)
++      return true;
++  }
++  return false;
++}
++
++}  // namespace
+ 
+ namespace {
+ 
+@@ -242,6 +267,8 @@
+             font_face_cache_->Get(request_description, family_name)) {
+       return face->GetFontData(request_description);
+     }
++    if (AgentFontCoreEnabled() && !AgentCoreFontFamily(String(family_name)))
++      return nullptr;
+   }
+ 
+   // Try to return the correct font based off our settings, in case we were
+diff --git a/third_party/blink/renderer/core/css/font_face_set.cc b/third_party/blink/renderer/core/css/font_face_set.cc
+--- a/third_party/blink/renderer/core/css/font_face_set.cc
++++ b/third_party/blink/renderer/core/css/font_face_set.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "third_party/blink/renderer/core/css/font_face_set.h"
+ 
++#include "base/command_line.h"
++#include "base/strings/string_util.h"
+ #include "base/task/single_thread_task_runner.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+ #include "third_party/blink/renderer/bindings/core/v8/v8_font_face_set_load_status.h"
+@@ -16,6 +18,29 @@
+ #include "third_party/blink/renderer/platform/wtf/text/strcat.h"
+ 
+ namespace blink {
++namespace {
++
++bool AgentFontCoreEnabled() {
++  return base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++             "electron-agent-font-policy") == "core";
++}
++
++bool AgentCoreFontFamily(const String& family) {
++  if (family.empty())
++    return false;
++  // Published core names only. Generic families never reach this helper.
++  // Host metrics still apply when one of these families is installed.
++  const char* const kNames[] = {"arial", "courier new", "georgia",
++                                "times new roman", "trebuchet ms", "verdana"};
++  const std::string folded = base::ToLowerASCII(family.Utf8());
++  for (const char* name : kNames) {
++    if (folded == name)
++      return true;
++  }
++  return false;
++}
++
++}  // namespace
+ 
+ const int FontFaceSet::kDefaultFontSize = 10;
+ 
+@@ -264,6 +289,10 @@
+       if (face && !face->CheckFont(c)) {
+         return false;
+       }
++      // A downloaded face may cover the character. A missing system family
++      // does not: under the core policy that is unavailable, not a fallback.
++      if (!face && AgentFontCoreEnabled())
++        return false;
+     }
+   }
+   return true;
+diff --git a/third_party/blink/renderer/modules/font_access/font_access.cc b/third_party/blink/renderer/modules/font_access/font_access.cc
+--- a/third_party/blink/renderer/modules/font_access/font_access.cc
++++ b/third_party/blink/renderer/modules/font_access/font_access.cc
+@@ -6,7 +6,9 @@
+ 
+ #include <algorithm>
+ 
++#include "base/command_line.h"
+ #include "base/feature_list.h"
++#include "base/strings/string_util.h"
+ #include "base/numerics/safe_conversions.h"
+ #include "services/network/public/mojom/permissions_policy/permissions_policy_feature.mojom-blink.h"
+ #include "third_party/blink/public/common/features.h"
+@@ -29,6 +31,26 @@
+ 
+ namespace {
+ 
++bool AgentFontCoreEnabled() {
++  return base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++             "electron-agent-font-policy") == "core";
++}
++
++bool AgentCoreFontFamily(const String& family) {
++  if (family.empty())
++    return false;
++  // Published core names only. Generic families never reach this helper.
++  // Host metrics still apply when one of these families is installed.
++  const char* const kNames[] = {"arial", "courier new", "georgia",
++                                "times new roman", "trebuchet ms", "verdana"};
++  const std::string folded = base::ToLowerASCII(family.Utf8());
++  for (const char* name : kNames) {
++    if (folded == name)
++      return true;
++  }
++  return false;
++}
++
+ const char kFeaturePolicyBlocked[] =
+     "Access to the feature \"local-fonts\" is disallowed by Permissions Policy";
+ }
+@@ -159,6 +181,10 @@
+         !selection_utf8.contains(element.postscript_name())) {
+       continue;
+     }
++    if (AgentFontCoreEnabled() &&
++        !AgentCoreFontFamily(String::FromUtf8(element.family()))) {
++      continue;
++    }
+ 
+     auto entry = FontEnumerationEntry{
+         .postscript_name = String::FromUtf8(element.postscript_name()),

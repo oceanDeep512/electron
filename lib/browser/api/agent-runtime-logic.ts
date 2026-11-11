@@ -27,7 +27,7 @@ export const checkpoint = Object.freeze({
     canvas: true,
     audio: true,
     webrtc: true,
-    fonts: false
+    fonts: true
   },
   // The snapshot API is wired to WebContents::RequestAXTreeSnapshot.
   // Response bodies are tee'd from the URL loader data pipe.
@@ -218,6 +218,8 @@ export interface Persona {
     availHeight: number;
     colorDepth: number;
     deviceScaleFactor: number;
+    colorIndex?: number;
+    highDynamicRange?: boolean;
   };
   webgl?: { vendor: string; renderer: string };
   webgpu?: { vendor: string; architecture: string; device: string; description: string };
@@ -327,8 +329,6 @@ export function validatePersona(value: unknown): PersonaValidation {
   const fontPolicy = value.fontPolicy === undefined ? 'real' : value.fontPolicy;
   if (fontPolicy !== 'real' && fontPolicy !== 'core') {
     errors.push("fontPolicy must be 'real' or 'core'");
-  } else if (fontPolicy === 'core') {
-    errors.push("fontPolicy 'core' is not implemented on this platform and is rejected");
   }
 
   let metadata: Persona['userAgentMetadata'] | null = null;
@@ -402,7 +402,9 @@ export function validatePersona(value: unknown): PersonaValidation {
       'availWidth',
       'availHeight',
       'colorDepth',
-      'deviceScaleFactor'
+      'deviceScaleFactor',
+      'colorIndex',
+      'highDynamicRange'
     ]);
     const screenRecord = value.screen;
     const dims = ['width', 'height', 'availWidth', 'availHeight'] as const;
@@ -421,14 +423,34 @@ export function validatePersona(value: unknown): PersonaValidation {
     if (okDims && (value.screen.availHeight as number) > (value.screen.height as number)) {
       errors.push('screen.availHeight cannot exceed height');
     }
-    if (okDims && COLOR_DEPTHS.has(value.screen.colorDepth as number)) {
+    let colorIndex: number | undefined;
+    if (screenRecord.colorIndex !== undefined) {
+      if (!Number.isInteger(screenRecord.colorIndex) || (screenRecord.colorIndex as number) < 0 || (screenRecord.colorIndex as number) > 65535) {
+        errors.push('screen.colorIndex must be an integer from 0 to 65535');
+      } else {
+        colorIndex = screenRecord.colorIndex as number;
+      }
+    }
+    let highDynamicRange: boolean | undefined;
+    if (screenRecord.highDynamicRange !== undefined) {
+      if (typeof screenRecord.highDynamicRange !== 'boolean') {
+        errors.push('screen.highDynamicRange must be a boolean');
+      } else {
+        highDynamicRange = screenRecord.highDynamicRange;
+      }
+    }
+    const colorIndexOk = screenRecord.colorIndex === undefined || colorIndex !== undefined;
+    const hdrOk = screenRecord.highDynamicRange === undefined || highDynamicRange !== undefined;
+    if (okDims && COLOR_DEPTHS.has(value.screen.colorDepth as number) && colorIndexOk && hdrOk) {
       screen = {
         width: value.screen.width as number,
         height: value.screen.height as number,
         availWidth: value.screen.availWidth as number,
         availHeight: value.screen.availHeight as number,
         colorDepth: value.screen.colorDepth as number,
-        deviceScaleFactor: value.screen.deviceScaleFactor as number
+        deviceScaleFactor: value.screen.deviceScaleFactor as number,
+        ...(colorIndex !== undefined ? { colorIndex } : {}),
+        ...(highDynamicRange !== undefined ? { highDynamicRange } : {})
       };
     }
   }
@@ -496,8 +518,7 @@ export function decidePersona(persona: unknown): PersonaDecision {
   }
   const validated = validatePersona(persona);
   if (!validated.ok) return { action: 'invalid', errors: validated.errors };
-  // fontPolicy 'core' is rejected in validatePersona. Every other surface in
-  // this checkpoint is applied. The seed perturbs canvas and audio readback.
+  // fontPolicy 'core' is applied. The seed perturbs canvas and audio readback.
   return { action: 'apply', persona: validated.persona };
 }
 

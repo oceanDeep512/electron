@@ -113,7 +113,7 @@ describe('agentRuntime checkpoint', () => {
     expect(agentRuntime.checkpoint.nativePersona.canvas).toBe(true);
     expect(agentRuntime.checkpoint.nativePersona.audio).toBe(true);
     expect(agentRuntime.checkpoint.nativePersona.webrtc).toBe(true);
-    expect(agentRuntime.checkpoint.nativePersona.fonts).toBe(false);
+    expect(agentRuntime.checkpoint.nativePersona.fonts).toBe(true);
     expect(agentRuntime.checkpoint.accessibilitySnapshot).toBe(true);
     expect(agentRuntime.checkpoint.responseBodyObservation).toBe(true);
     expect(agentRuntime.checkpoint.webSocketMessageObservation).toBe(true);
@@ -138,7 +138,7 @@ describe('agentRuntime checkpoint', () => {
     }
   });
 
-  it('rejects an invalid persona and fontPolicy core before applying anything', () => {
+  it('rejects an invalid persona before applying anything and accepts fontPolicy core', () => {
     const partition = partitionName();
     try {
       // @ts-expect-error a seed by itself is not a persona
@@ -149,16 +149,9 @@ describe('agentRuntime checkpoint', () => {
     }
     const core = samplePersona();
     core.fontPolicy = 'core';
-    try {
-      agentRuntime.createSession({ partition, persona: core });
-      expect.fail('fontPolicy core should be rejected');
-    } catch (error) {
-      expect(errorCode(error)).toBe('font-policy-unavailable');
-      expect(String(error)).toContain("fontPolicy 'core' is not implemented on this platform and is rejected");
-    }
-    const created = createSession({ partition });
-    expect(created.personaApplied).toBe(false);
-    expect(created.personaId).toBe(null);
+    const created = createSession({ partition, persona: core });
+    expect(created.personaApplied).toBe(true);
+    expect(typeof created.personaId).toBe('string');
   });
 
   it('applies the implemented persona surfaces and refuses a different persona on the same partition', () => {

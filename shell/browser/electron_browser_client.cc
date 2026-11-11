@@ -8,6 +8,7 @@
 #include <shlobj.h>
 #endif
 
+#include <algorithm>
 #include <memory>
 #include <string_view>
 #include <utility>
@@ -748,6 +749,18 @@ void ElectronBrowserClient::AppendExtraCommandLineSwitches(
                                           persona->webgpu_device);
           command_line->AppendSwitchASCII(switches::kAgentWebGPUDescription,
                                           persona->webgpu_description);
+        }
+        if (persona->font_policy_core) {
+          command_line->AppendSwitchASCII(switches::kAgentFontPolicy, "core");
+        }
+        if (persona->has_screen_color_index) {
+          command_line->AppendSwitchASCII(
+              switches::kAgentColorIndex,
+              base::NumberToString(persona->screen_color_index));
+        }
+        if (persona->has_screen_hdr) {
+          command_line->AppendSwitchASCII(switches::kAgentHdr,
+                                          persona->screen_hdr ? "1" : "0");
         }
       }
     }
@@ -1824,19 +1837,82 @@ void ElectronBrowserClient::CreateWebSocket(
       electron_context->intercept_state()->websocket_enabled();
 
 #if BUILDFLAG(ENABLE_ELECTRON_EXTENSIONS)
-  // Extension websocket proxies replace this hop. They are not wrapped, so
-  // message observation does not see those sockets. Observation itself skips
-  // this return and uses ProxyingWebSocket.
-  if (!observe_messages && !web_request->HasListener()) {
-    auto* web_request_api = extensions::BrowserContextKeyedAPIFactory<
-        extensions::WebRequestAPI>::Get(browser_context);
-
-    if (web_request_api && web_request_api->MayHaveProxies()) {
-      web_request_api->ProxyWebSocket(
-          frame, std::move(factory), url, site_for_cookies, user_agent,
-          std::move(handshake_client), std::move(options.header_client));
-      return;
-    }
+  auto* web_request_api = extensions::BrowserContextKeyedAPIFactory<
+      extensions::WebRequestAPI>::Get(browser_context);
+  const bool extension_proxy =
+      web_request_api && web_request_api->MayHaveProxies();
+  // No observation and no Electron webRequest listener: the extension proxy
+  // remains the only hop.
+  if (!observe_messages && !web_request->HasListener() && extension_proxy) {
+    web_request_api->ProxyWebSocket(
+        frame, std::move(factory), url, site_for_cookies, user_agent,
+        std::move(handshake_client), std::move(options.header_client));
+    return;
+  }
+  // Observation stays on Electron's forwarder. The extension proxy is the
+  // next hop, so both run. Shared and service workers never reach here.
+  if (observe_messages && extension_proxy) {
+    const auto frame_id = frame->GetGlobalId();
+    factory = base::BindOnce(
+        [](extensions::WebRequestAPI* api,
+           content::GlobalRenderFrameHostId frame_id,
+           content::ContentBrowserClient::WebSocketFactory network_factory,
+           net::SiteForCookies site_for_cookies,
+           std::optional<std::string> user_agent, const GURL& request_url,
+           std::vector<network::mojom::HttpHeaderPtr> electron_headers,
+           mojo::PendingRemote<network::mojom::WebSocketHandshakeClient>
+               handshake_client,
+           mojo::PendingRemote<network::mojom::WebSocketAuthenticationHandler>
+               electron_auth,
+           mojo::PendingRemote<network::mojom::TrustedHeaderClient>
+               header_client) {
+          content::RenderFrameHost* live =
+              content::RenderFrameHost::FromID(frame_id);
+          if (!live)
+            return;
+          auto wrapped = base::BindOnce(
+              [](content::ContentBrowserClient::WebSocketFactory inner,
+                 std::vector<network::mojom::HttpHeaderPtr> first_headers,
+                 mojo::PendingRemote<
+                     network::mojom::WebSocketAuthenticationHandler>
+                     first_auth,
+                 const GURL& inner_url,
+                 std::vector<network::mojom::HttpHeaderPtr> extension_headers,
+                 mojo::PendingRemote<network::mojom::WebSocketHandshakeClient>
+                     inner_client,
+                 mojo::PendingRemote<
+                     network::mojom::WebSocketAuthenticationHandler>
+                     extension_auth,
+                 mojo::PendingRemote<network::mojom::TrustedHeaderClient>
+                     inner_header) {
+                std::vector<network::mojom::HttpHeaderPtr> merged;
+                std::vector<std::string> seen;
+                auto take = [&](network::mojom::HttpHeaderPtr header) {
+                  const std::string key = base::ToLowerASCII(header->name);
+                  if (std::find(seen.begin(), seen.end(), key) != seen.end())
+                    return;
+                  seen.push_back(key);
+                  merged.push_back(std::move(header));
+                };
+                for (auto& header : extension_headers)
+                  take(std::move(header));
+                for (auto& header : first_headers)
+                  take(std::move(header));
+                auto auth = extension_auth.is_valid() ? std::move(extension_auth)
+                                                      : std::move(first_auth);
+                std::move(inner).Run(inner_url, std::move(merged),
+                                     std::move(inner_client), std::move(auth),
+                                     std::move(inner_header));
+              },
+              std::move(network_factory), std::move(electron_headers),
+              std::move(electron_auth));
+          api->ProxyWebSocket(live, std::move(wrapped), request_url,
+                              site_for_cookies, user_agent,
+                              std::move(handshake_client),
+                              std::move(header_client));
+        },
+        web_request_api, frame_id, std::move(factory), site_for_cookies,
+        user_agent);
   }
 #endif
 

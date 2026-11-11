@@ -119,7 +119,7 @@ test('checkpoint records the pinned baseline and per-surface persona flags', () 
   assert.equal(checkpoint.nativePersona.canvas, true);
   assert.equal(checkpoint.nativePersona.audio, true);
   assert.equal(checkpoint.nativePersona.webrtc, true);
-  assert.equal(checkpoint.nativePersona.fonts, false);
+  assert.equal(checkpoint.nativePersona.fonts, true);
   assert.equal(checkpoint.accessibilitySnapshot, true);
   assert.equal(checkpoint.responseBodyObservation, true);
   assert.equal(checkpoint.webSocketMessageObservation, true);
@@ -195,10 +195,39 @@ test('implemented persona surfaces apply and the rest are refused', () => {
   }));
   assert.equal(emptyVersion.ok, false);
   const fontCore = decidePersona(validPersona({ fontPolicy: 'core', screen: undefined, webgl: undefined, webgpu: undefined, webrtcIpHandlingPolicy: 'default' }));
-  assert.equal(fontCore.action, 'invalid');
-  if (fontCore.action === 'invalid') {
-    assert.equal(fontCore.errors.some((error) => error.includes("fontPolicy 'core'")), true);
+  assert.equal(fontCore.action, 'apply');
+  if (fontCore.action === 'apply') {
+    assert.equal(fontCore.persona.fontPolicy, 'core');
   }
+  const indexed = validatePersona(validPersona({
+    screen: {
+      width: 1920,
+      height: 1080,
+      availWidth: 1920,
+      availHeight: 1040,
+      colorDepth: 24,
+      deviceScaleFactor: 1,
+      colorIndex: 256,
+      highDynamicRange: false
+    }
+  }));
+  assert.equal(indexed.ok, true);
+  if (indexed.ok) {
+    assert.equal(indexed.persona.screen?.colorIndex, 256);
+    assert.equal(indexed.persona.screen?.highDynamicRange, false);
+  }
+  const badIndex = validatePersona(validPersona({
+    screen: {
+      width: 1920,
+      height: 1080,
+      availWidth: 1920,
+      availHeight: 1040,
+      colorDepth: 24,
+      deviceScaleFactor: 1,
+      colorIndex: -1
+    }
+  }));
+  assert.equal(badIndex.ok, false);
   const validated = validatePersona(validPersona());
   assert.equal(validated.ok, true);
   if (!validated.ok) return;

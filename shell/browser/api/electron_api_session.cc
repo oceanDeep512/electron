@@ -1476,6 +1476,15 @@ void Session::SetAgentPersona(gin::Arguments* args) {
       args->ThrowTypeError("screen metrics are invalid");
       return;
     }
+    if (screen.Get("colorIndex", &persona.screen_color_index)) {
+      if (persona.screen_color_index < 0 || persona.screen_color_index > 65535) {
+        args->ThrowTypeError("screen.colorIndex is invalid");
+        return;
+      }
+      persona.has_screen_color_index = true;
+    }
+    if (screen.Get("highDynamicRange", &persona.screen_hdr))
+      persona.has_screen_hdr = true;
   }
   gin_helper::Dictionary webgl;
   if (options.Get("webgl", &webgl)) {
@@ -1502,6 +1511,15 @@ void Session::SetAgentPersona(gin::Arguments* args) {
     }
   }
   options.Get("webrtcIpHandlingPolicy", &persona.webrtc_ip_handling_policy);
+  std::string font_policy;
+  if (options.Get("fontPolicy", &font_policy)) {
+    if (font_policy == "core") {
+      persona.font_policy_core = true;
+    } else if (font_policy != "real") {
+      args->ThrowTypeError("fontPolicy must be real or core");
+      return;
+    }
+  }
   error = browser_context_->ApplyAgentPersona(std::move(persona));
   if (!error.empty())
     args->ThrowTypeError(error);

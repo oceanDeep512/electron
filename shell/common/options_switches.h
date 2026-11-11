@@ -355,6 +355,11 @@ inline constexpr base::cstring_view kAgentCanvasSeed =
     "electron-agent-canvas-seed";
 inline constexpr base::cstring_view kAgentAudioSeed =
     "electron-agent-audio-seed";
+inline constexpr base::cstring_view kAgentFontPolicy =
+    "electron-agent-font-policy";
+inline constexpr base::cstring_view kAgentColorIndex =
+    "electron-agent-color-index";
+inline constexpr base::cstring_view kAgentHdr = "electron-agent-hdr";
 
 }  // namespace switches
 

@@ -25,6 +25,7 @@
 #include "services/network/public/mojom/network_context.mojom.h"
 #include "shell/browser/api/electron_api_session.h"
 #include "shell/browser/electron_browser_context.h"
+#include "shell/browser/net/websocket_message_observer.h"
 #include "shell/browser/javascript_environment.h"
 #include "shell/common/gin_converters/gurl_converter.h"
 #include "shell/common/gin_converters/net_converter.h"
@@ -273,6 +274,10 @@ void WebSocketWrapper::OnFailure(const std::string& message,
   // After OnFailure the network service drops the handshake mojo pipe. Avoid
   // double-reporting via the disconnect handler.
   handshake_receiver_.set_disconnect_handler(base::DoNothing());
+  if (browser_context_) {
+    NotifyWebSocketHandshakeFailed(browser_context_->intercept_state(), url_,
+                                   net_error);
+  }
   Fail(message, net_error);
 }
 
@@ -286,17 +291,26 @@ void WebSocketWrapper::OnConnectionEstablished(
   if (state_ != State::kConnecting)
     return;
 
-  websocket_.Bind(std::move(websocket));
-  client_receiver_.Bind(std::move(client_receiver));
+  // Same forwarder as page sockets. The session is the one passed to
+  // net.WebSocket, which is this wrapper's BrowserContext.
+  std::string accepted_extensions =
+      response ? response->extensions : std::string();
+  auto ends = ObserveWebSocketConnection(
+      browser_context_ ? browser_context_->intercept_state() : nullptr, url_,
+      accepted_extensions, std::move(websocket), std::move(client_receiver),
+      std::move(readable), std::move(writable));
 
-  readable_ = std::move(readable);
+  websocket_.Bind(std::move(ends.socket));
+  client_receiver_.Bind(std::move(ends.client_receiver));
+
+  readable_ = std::move(ends.readable);
   CHECK_EQ(readable_watcher_.Watch(
                readable_.get(), MOJO_HANDLE_SIGNAL_READABLE,
                MOJO_TRIGGER_CONDITION_SIGNALS_SATISFIED,
                base::BindRepeating(&WebSocketWrapper::OnReadable, WeakRef())),
            MOJO_RESULT_OK);
 
-  writable_ = std::move(writable);
+  writable_ = std::move(ends.writable);
   CHECK_EQ(writable_watcher_.Watch(
                writable_.get(), MOJO_HANDLE_SIGNAL_WRITABLE,
                MOJO_TRIGGER_CONDITION_SIGNALS_SATISFIED,

@@ -121,6 +121,11 @@ class ElectronBrowserContext : public content::BrowserContext {
     int screen_avail_height = 0;
     int screen_color_depth = 0;
     double screen_device_scale_factor = 0;
+    bool has_screen_color_index = false;
+    int screen_color_index = 0;
+    bool has_screen_hdr = false;
+    bool screen_hdr = false;
+    bool font_policy_core = false;
     std::string webgl_vendor;
     std::string webgl_renderer;
     std::string webgpu_vendor;
