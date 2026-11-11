@@ -1,12 +1,11 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Electron Agent Runtime <agent-runtime@electron.local>
-Date: Wed, 11 Nov 2026 19:10:00 +0000
+Date: Wed, 11 Nov 2026 19:40:00 +0000
 Subject: [electron] perturb offline audio results and analyser readings
 
 An agent persona passes these values on the renderer command line. The
-switches are absent unless that renderer belongs to a persona session, so
-other processes keep Chromium's behavior. Nothing here is compiled in this
-change.
+offline result is perturbed once per AudioBuffer. Analyser readings are
+perturbed on the output arrays. Nothing here is compiled in this change.
 
 diff --git a/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc b/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
 --- a/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
@@ -23,7 +22,7 @@ diff --git a/third_party/blink/renderer/modules/webaudio/offline_audio_context.c
  #include "base/metrics/histogram_functions.h"
  #include "base/metrics/histogram_macros.h"
  #include "base/numerics/safe_conversions.h"
-@@ -560,6 +563,40 @@
+@@ -560,6 +563,41 @@
    return promise;
  }
  
@@ -44,8 +43,9 @@ diff --git a/third_party/blink/renderer/modules/webaudio/offline_audio_context.c
 +}
 +
 +void PerturbOfflineResult(AudioBuffer* buffer) {
-+  if (!AgentAudioEnabled() || !buffer)
++  if (!AgentAudioEnabled() || !buffer || buffer->AgentReadbackPerturbed())
 +    return;
++  buffer->MarkAgentReadbackPerturbed();
 +  const uint32_t hash = AgentAudioHash();
 +  for (unsigned channel = 0; channel < buffer->numberOfChannels(); ++channel) {
 +    NotShared<DOMFloat32Array> data = buffer->getChannelData(channel);
@@ -64,7 +64,7 @@ diff --git a/third_party/blink/renderer/modules/webaudio/offline_audio_context.c
  void OfflineAudioContext::OnChunkRendered() {
    DCHECK(IsMainThread());
  
-@@ -578,6 +615,7 @@
+@@ -578,6 +616,7 @@
    Member<AudioBuffer> rendered_buffer = pending_render_targets_.front();
  
    CHECK(rendered_buffer);
@@ -162,3 +162,26 @@ diff --git a/third_party/blink/renderer/modules/webaudio/analyser_node.cc b/thir
  }
  
  void AnalyserNode::ReportDidCreate() {
+diff --git a/third_party/blink/renderer/modules/webaudio/audio_buffer.h b/third_party/blink/renderer/modules/webaudio/audio_buffer.h
+--- a/third_party/blink/renderer/modules/webaudio/audio_buffer.h
++++ b/third_party/blink/renderer/modules/webaudio/audio_buffer.h
+@@ -109,6 +109,11 @@
+ 
+   void Zero();
+ 
++  // Electron persona readback. Set after the offline result is perturbed so a
++  // second render of this same buffer does not apply the seed twice.
++  bool AgentReadbackPerturbed() const { return agent_readback_perturbed_; }
++  void MarkAgentReadbackPerturbed() { agent_readback_perturbed_ = true; }
++
+   void Trace(Visitor* visitor) const override {
+     visitor->Trace(channels_);
+     ScriptWrappable::Trace(visitor);
+@@ -121,6 +126,7 @@
+ 
+   float sample_rate_;
+   uint32_t length_;
++  bool agent_readback_perturbed_ = false;
+ 
+   HeapVector<Member<DOMFloat32Array>> channels_;
+ };

@@ -10,6 +10,8 @@ changes:
     description: "Applied user agent, language, timezone, and hardware persona surfaces."
   - pr-url: https://github.com/oceanDeep512/electron/pull/1
     description: "Applied screen, graphics identifiers, canvas and audio readback, and WebRTC persona surfaces."
+  - pr-url: https://github.com/oceanDeep512/electron/pull/1
+    description: "Matched resolution and color media queries to the persona screen."
 ```
 -->
 
@@ -59,7 +61,7 @@ An `Object` frozen record of the pinned baseline and which stages are present in
   * `timezone` boolean - `true` for that session's renderer processes, including their workers.
   * `hardwareConcurrency` boolean
   * `deviceMemory` boolean
-  * `screen` boolean - `true` for `screen` metrics, `device-width` and `device-height` media, and `window.devicePixelRatio`. Layout and offscreen rendering keep the real scale.
+  * `screen` boolean - `true` for `screen` metrics, `device-width` and `device-height`, `resolution` and prefixed device-pixel-ratio media, `window.devicePixelRatio`, and the CSS `color` feature derived from `colorDepth`. Layout and offscreen rendering keep the real scale.
   * `webgl` boolean - `true` for `GL_VENDOR`, `GL_RENDERER`, and the unmasked vendor and renderer strings.
   * `webgpu` boolean - `true` for adapter vendor, architecture, device, and description. Adapter limits stay real.
   * `canvas` boolean - `true` for seeded readback perturbation. The displayed bitmap is not changed.
@@ -194,6 +196,9 @@ This is not a capture of every network response. It does not see requests that l
 added:
   - pr-url: https://github.com/oceanDeep512/electron/pull/1
     description: "Added bounded WebSocket message observation."
+changes:
+  - pr-url: https://github.com/oceanDeep512/electron/pull/1
+    description: "Observed WebSocket messages from shared workers and service workers."
 ```
 -->
 
@@ -207,11 +212,11 @@ added:
 
 Returns `Function` - Call the returned function to remove this listener. The last listener turns observation off for the session.
 
-Observation is opt-in and session scoped. With no listeners, page and dedicated-worker sockets are not proxied for messages. The listener receives message bytes, which may contain secrets. This method does not redact them and does not write them to disk or to a log.
+Observation is opt-in and session scoped. With no listeners, renderer sockets are not proxied for messages. The listener receives message bytes, which may contain secrets. This method does not redact them and does not write them to disk or to a log.
 
 `body` is the logical message. Incoming frames are the bytes `net::WebSocketChannel` delivered after `WebSocketDeflateStream` inflation. Outgoing bytes are what the renderer wrote before the network service deflates them. `wireCompressed` is true when the handshake extensions include `permessage-deflate`. `text` is set only for a complete, valid UTF-8 text message. A truncated or invalid text message keeps `text` null and still carries the captured bytes. Ping and pong are not events. A redirect-style event is not synthesized.
 
-Shared workers, service workers, and `net.WebSocket` are outside this path. Extension websocket proxies are also outside it. Handshake failure emits `failed` and no body. A capture limit skips or truncates the copy and does not drop the socket's real frames.
+Pages, dedicated workers, shared workers, and service workers that connect through Chromium's `WebSocketConnector` are observed. A shared or service worker has no frame; the socket is attributed to the `BrowserContext` of its renderer process. `net.WebSocket` in the main process does not use that connector and is not observed. An extension WebSocket proxy is not wrapped. When observation is on, a page socket skips that proxy and uses Electron's forwarder. Handshake failure emits `failed` and no body. A capture limit skips or truncates the copy and does not drop the socket's real frames.
 
 #### `session.close()`
 

@@ -1,12 +1,12 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Electron Agent Runtime <agent-runtime@electron.local>
-Date: Wed, 11 Nov 2026 19:10:00 +0000
+Date: Wed, 11 Nov 2026 19:40:00 +0000
 Subject: [electron] override WebGL and WebGPU adapter identifiers
 
 An agent persona passes these values on the renderer command line. The
 switches are absent unless that renderer belongs to a persona session, so
-other processes keep Chromium's behavior. Nothing here is compiled in this
-change.
+other processes keep Chromium's behavior. WebGPU strings are initialized once.
+Nothing here is compiled in this change.
 
 diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 --- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
@@ -86,52 +86,57 @@ diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_ba
 diff --git a/third_party/blink/renderer/modules/webgpu/gpu_adapter_info.cc b/third_party/blink/renderer/modules/webgpu/gpu_adapter_info.cc
 --- a/third_party/blink/renderer/modules/webgpu/gpu_adapter_info.cc
 +++ b/third_party/blink/renderer/modules/webgpu/gpu_adapter_info.cc
-@@ -4,11 +4,44 @@
+@@ -4,11 +4,49 @@
  
  #include "third_party/blink/renderer/modules/webgpu/gpu_adapter_info.h"
  
 +#include "base/command_line.h"
++#include "base/no_destructor.h"
  #include "third_party/blink/renderer/modules/webgpu/gpu_memory_heap_info.h"
  #include "third_party/blink/renderer/modules/webgpu/gpu_subgroup_matrix_config.h"
  
  namespace blink {
  
++struct AgentWebGPUStrings {
++  String vendor;
++  String architecture;
++  String device;
++  String description;
++};
++
++AgentWebGPUStrings ReadAgentWebGPUStrings() {
++  AgentWebGPUStrings values;
++  const base::CommandLine* command_line =
++      base::CommandLine::ForCurrentProcess();
++  values.vendor = String::FromUtf8(
++      command_line->GetSwitchValueASCII("electron-agent-webgpu-vendor"));
++  values.architecture = String::FromUtf8(command_line->GetSwitchValueASCII(
++      "electron-agent-webgpu-architecture"));
++  values.device = String::FromUtf8(
++      command_line->GetSwitchValueASCII("electron-agent-webgpu-device"));
++  values.description = String::FromUtf8(
++      command_line->GetSwitchValueASCII("electron-agent-webgpu-description"));
++  return values;
++}
++
 +const String& AgentWebGPUOverride(const char* switch_name) {
-+  // The command line does not change. A process-lifetime string can be
-+  // returned by the const getters. Empty means no override.
-+  static String vendor;
-+  static String architecture;
-+  static String device;
-+  static String description;
-+  static bool ready = false;
-+  if (!ready) {
-+    vendor = String::FromUtf8(base::CommandLine::ForCurrentProcess()
-+                                  ->GetSwitchValueASCII(
-+                                      "electron-agent-webgpu-vendor"));
-+    architecture = String::FromUtf8(
-+        base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
-+            "electron-agent-webgpu-architecture"));
-+    device = String::FromUtf8(base::CommandLine::ForCurrentProcess()
-+                                  ->GetSwitchValueASCII(
-+                                      "electron-agent-webgpu-device"));
-+    description = String::FromUtf8(
-+        base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
-+            "electron-agent-webgpu-description"));
-+    ready = true;
-+  }
-+  if (std::string(switch_name) == "electron-agent-webgpu-vendor")
-+    return vendor;
-+  if (std::string(switch_name) == "electron-agent-webgpu-architecture")
-+    return architecture;
-+  if (std::string(switch_name) == "electron-agent-webgpu-device")
-+    return device;
-+  return description;
++  // Function-local static initialization runs once, including across threads.
++  // NoDestructor keeps the strings for the process lifetime.
++  static base::NoDestructor<AgentWebGPUStrings> values(ReadAgentWebGPUStrings());
++  const std::string name(switch_name);
++  if (name == "electron-agent-webgpu-vendor")
++    return values->vendor;
++  if (name == "electron-agent-webgpu-architecture")
++    return values->architecture;
++  if (name == "electron-agent-webgpu-device")
++    return values->device;
++  return values->description;
 +}
 +
  GPUAdapterInfo::GPUAdapterInfo(const String& vendor,
                                 const String& architecture,
                                 uint32_t subgroup_min_size,
-@@ -46,19 +79,27 @@
+@@ -46,19 +84,27 @@
  }
  
  const String& GPUAdapterInfo::vendor() const {

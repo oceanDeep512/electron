@@ -148,3 +148,5 @@ agent_persona_screen_metrics.patch
 agent_persona_webgl_webgpu_identifiers.patch
 agent_persona_canvas_readback.patch
 agent_persona_audio_readback.patch
+agent_persona_media_query_screen.patch
+agent_runtime_worker_websocket.patch

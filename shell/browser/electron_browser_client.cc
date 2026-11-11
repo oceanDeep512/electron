@@ -1731,10 +1731,9 @@ bool ElectronBrowserClient::HasWebRequestAPIProxy(
 
 bool ElectronBrowserClient::WillInterceptWebSocket(
     content::RenderFrameHost* frame) {
-  // Shared workers and service workers call this with a null frame
-  // (frame_routing_id is kRoutingIdNone). Dedicated workers pass the creator
-  // document's frame and share this path with pages. Main-process
-  // net.WebSocket never reaches here.
+  // Pages and dedicated workers. Shared and service workers use
+  // WillInterceptWorkerWebSocket because their connector has no frame.
+  // Main-process net.WebSocket never reaches either hook.
   if (!frame)
     return false;
 
@@ -1766,6 +1765,42 @@ bool ElectronBrowserClient::WillInterceptWebSocket(
 #endif
 
   return has_listener;
+}
+
+bool ElectronBrowserClient::WillInterceptWorkerWebSocket(
+    content::RenderProcessHost* process) {
+  if (!process)
+    return false;
+  auto* context =
+      static_cast<ElectronBrowserContext*>(process->GetBrowserContext());
+  return context && context->intercept_state() &&
+         context->intercept_state()->websocket_enabled();
+}
+
+void ElectronBrowserClient::CreateWorkerWebSocket(
+    content::RenderProcessHost* process,
+    const url::Origin& origin,
+    WebSocketFactory factory,
+    const GURL& url,
+    const net::SiteForCookies& site_for_cookies,
+    const std::optional<std::string>& user_agent,
+    mojo::PendingRemote<network::mojom::WebSocketHandshakeClient>
+        handshake_client,
+    WebSocketOptions options) {
+  if (!process)
+    return;
+  v8::Isolate* isolate = JavascriptEnvironment::GetIsolate();
+  v8::HandleScope scope(isolate);
+  auto* browser_context = process->GetBrowserContext();
+  auto* web_request = api::WebRequest::FromOrCreate(isolate, browser_context);
+  DCHECK(web_request);
+  // The worker has no frame. The process BrowserContext is the session.
+  // Extension websocket proxies are not on this path: a null frame never
+  // reached ProxyWebSocket, and this hook runs only while observation is on.
+  ProxyingWebSocket::StartProxying(
+      web_request, std::move(factory), url, site_for_cookies, user_agent,
+      std::move(handshake_client), true, process->GetDeprecatedID(),
+      IPC::mojom::kRoutingIdNone, origin, browser_context, &next_id_);
 }
 
 void ElectronBrowserClient::CreateWebSocket(

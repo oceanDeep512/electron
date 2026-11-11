@@ -817,6 +817,10 @@ describe('agentRuntime websocket messages', () => {
   // The native forwarder pauses the Mojo message pipe after one unread data
   // frame, so a slow consumer stops upstream metadata instead of dropping it.
   // That pause is source-only and is not exercised here.
+  // Shared workers and service workers are wired through
+  // WillInterceptWorkerWebSocket. This fixture only opens a page socket, and
+  // these specs are not executed until an Electron binary exists. net.WebSocket
+  // and extension-proxied sockets stay outside the observer.
 
   it('rejects an invalid message limit before any socket', () => {
     const runtimeSession = createSession();
