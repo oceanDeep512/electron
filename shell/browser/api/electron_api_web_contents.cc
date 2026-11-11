@@ -2087,6 +2087,10 @@ void WebContents::InitWithSessionAndOptions(
     accept_languages += language + ",";
   }
   accept_languages.pop_back();
+  if (const auto* persona = browser_context->agent_persona()) {
+    if (!persona->accept_languages.empty())
+      accept_languages = persona->accept_languages;
+  }
   prefs->accept_languages = accept_languages;
 
 #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_WIN)
@@ -4433,6 +4437,10 @@ v8::Local<v8::Promise> WebContents::RestoreHistory(
 
   blink::UserAgentOverride ua_override;
   ua_override.ua_string_override = GetUserAgent();
+  if (GetBrowserContext()->agent_persona()) {
+    ua_override.ua_metadata_override =
+        GetBrowserContext()->GetAgentUserAgentMetadata();
+  }
 
   for (const auto& entry : entries) {
     content::NavigationEntry* nav_entry = nullptr;
@@ -4627,8 +4635,12 @@ void WebContents::ForcefullyCrashRenderer() {
 void WebContents::SetUserAgent(const std::string& user_agent) {
   blink::UserAgentOverride ua_override;
   ua_override.ua_string_override = user_agent;
-  if (!user_agent.empty())
+  if (GetBrowserContext()->agent_persona()) {
+    ua_override.ua_metadata_override =
+        GetBrowserContext()->GetAgentUserAgentMetadata();
+  } else if (!user_agent.empty()) {
     ua_override.ua_metadata_override = embedder_support::GetUserAgentMetadata();
+  }
 
   web_contents()->SetUserAgentOverride(ua_override, false);
 }

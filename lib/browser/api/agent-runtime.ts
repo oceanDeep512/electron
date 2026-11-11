@@ -29,6 +29,7 @@ import {
   createResponseObservationBudget,
   cssPointToWidgetDip,
   decidePersona,
+  personaStorageId,
   hostEffectAllowed,
   normalizeResponseObservation,
   ownedWebPreferences,
@@ -58,6 +59,7 @@ import {
   type EffectGate,
   type ElementBox,
   type NavigationStatus,
+  type Persona,
   type ResolvedPartition,
   type SlotState
 } from '@electron/internal/browser/api/agent-runtime-logic';
@@ -125,6 +127,25 @@ interface NativeResponseSession {
     options?: WebSocketObservationPolicy
   ): void;
   updateWebSocketMessageObservationLimits(options: WebSocketObservationPolicy): void;
+  setAgentPersona(persona: {
+    id: string;
+    userAgent: string;
+    acceptLanguages: string;
+    timezone: string;
+    hardwareConcurrency: number;
+    deviceMemory: number;
+    brands: { brand: string; version: string }[];
+    fullVersionList: { brand: string; version: string }[];
+    fullVersion: string;
+    platform: string;
+    platformVersion: string;
+    architecture: string;
+    bitness: string;
+    model: string;
+    mobile: boolean;
+    wow64: boolean;
+    formFactors: string[];
+  }): void;
 }
 
 interface NativeWebSocketEvent {
@@ -159,8 +180,8 @@ interface SocketSubscriber {
 }
 
 interface SessionApi {
-  readonly personaApplied: false;
-  readonly personaId: null;
+  readonly personaApplied: boolean;
+  readonly personaId: string | null;
   readonly persist: boolean;
   readonly storagePartition: string;
   readonly session: Session;
@@ -653,8 +674,6 @@ function asResponseEvent(event: NativeResponseEvent): ResponseObservationEvent |
 }
 
 class AgentSession {
-  readonly personaApplied = false as const;
-  readonly personaId = null;
   readonly api: SessionApi;
   private readonly pages = new Set<AgentPage>();
   private readonly responseSubscribers = new Set<ResponseSubscriber>();
@@ -665,7 +684,9 @@ class AgentSession {
 
   constructor(
     readonly partition: ResolvedPartition,
-    readonly session: Session
+    readonly session: Session,
+    readonly personaApplied: boolean,
+    readonly personaId: string | null
   ) {
     const self = this;
     this.api = {
@@ -898,31 +919,61 @@ class AgentSession {
 
 const sessions = new Map<string, AgentSession>();
 
+function nativePersonaPayload(persona: Persona) {
+  return {
+    id: personaStorageId(persona),
+    userAgent: persona.userAgent,
+    acceptLanguages: persona.acceptLanguages.join(','),
+    timezone: persona.timezone,
+    hardwareConcurrency: persona.hardwareConcurrency,
+    deviceMemory: persona.deviceMemory,
+    brands: persona.userAgentMetadata.brands,
+    fullVersionList: persona.userAgentMetadata.fullVersionList,
+    fullVersion: persona.userAgentMetadata.fullVersion,
+    platform: persona.userAgentMetadata.platform,
+    platformVersion: persona.userAgentMetadata.platformVersion,
+    architecture: persona.userAgentMetadata.architecture,
+    bitness: persona.userAgentMetadata.bitness,
+    model: persona.userAgentMetadata.model,
+    mobile: persona.userAgentMetadata.mobile,
+    wow64: persona.userAgentMetadata.wow64,
+    formFactors: persona.userAgentMetadata.formFactors
+  };
+}
+
 function createSession(options: { partition: unknown; persist?: unknown; persona?: unknown }): SessionApi {
   const decision = decidePersona(options.persona);
   if (decision.action === 'invalid') {
-    throw failure('invalid-persona', decision.errors.join('; '));
+    const fontRejected = decision.errors.some((error) => error.includes("fontPolicy 'core'"));
+    throw failure(
+      fontRejected ? 'font-policy-unavailable' : 'invalid-persona',
+      decision.errors.join('; ')
+    );
   }
   if (decision.action === 'unavailable') {
     throw failure(
-      'native-persona-unavailable',
-      'Native fingerprint persona is not implemented. validatePersona() only checks the config and does not change the renderer, network stack, or any page. Omit persona until that stage is wired.'
+      'persona-surface-unavailable',
+      `These persona surfaces are not implemented and were not applied: ${decision.surfaces.join(', ')}`
     );
   }
+  const personaId = decision.action === 'apply' ? personaStorageId(decision.persona) : null;
   const resolved = resolvePartition(options);
   const existing = sessions.get(resolved.storagePartition);
   const reuse = checkPartitionReuse(
     existing && !existing.isClosed
       ? { persist: existing.persist, personaApplied: existing.personaApplied, personaId: existing.personaId }
       : undefined,
-    { ...resolved, personaId: null }
+    { ...resolved, personaId }
   );
   if (reuse === 'reuse' && existing) return existing.api;
   if (!app.isReady()) {
     throw failure('app-not-ready', 'createSession requires the app ready event');
   }
   const electronSession = session.fromPartition(resolved.storagePartition);
-  const created = new AgentSession(resolved, electronSession);
+  if (decision.action === 'apply') {
+    (electronSession as Session & NativeResponseSession).setAgentPersona(nativePersonaPayload(decision.persona));
+  }
+  const created = new AgentSession(resolved, electronSession, decision.action === 'apply', personaId);
   sessions.set(resolved.storagePartition, created);
   return created.api;
 }

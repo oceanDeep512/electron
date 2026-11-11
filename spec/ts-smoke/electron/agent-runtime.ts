@@ -6,12 +6,14 @@ const flags = agentRuntime.checkpoint;
 const controlPlane: boolean = flags.controlPlane;
 const accessibility: boolean = flags.accessibilitySnapshot;
 const responseBodies: boolean = flags.responseBodyObservation;
-const personaOff: boolean = flags.nativePersona;
+const personaUserAgent: boolean = flags.nativePersona.userAgent;
+const personaScreen: boolean = flags.nativePersona.screen;
 const webSocketMessages: boolean = flags.webSocketMessageObservation;
 void controlPlane;
 void accessibility;
 void responseBodies;
-void personaOff;
+void personaUserAgent;
+void personaScreen;
 void webSocketMessages;
 
 const runtimeSession = agentRuntime.createSession({ partition: 'persist:agent-smoke' });

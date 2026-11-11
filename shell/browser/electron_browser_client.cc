@@ -27,6 +27,7 @@
 #include "base/path_service.h"
 #include "base/process/process_metrics.h"
 #include "base/strings/escape.h"
+#include "base/strings/string_number_conversions.h"
 #include "base/strings/string_util.h"
 #include "chrome/browser/browser_process.h"
 #include "chrome/browser/picture_in_picture/video_overlay_window.h"
@@ -689,6 +690,20 @@ void ElectronBrowserClient::AppendExtraCommandLineSwitches(
     content::ChildProcessId unsafe_process_id =
         content::ChildProcessId::FromUnsafeValue(process_id);
     auto* render_process_host = content::RenderProcessHost::FromID(process_id);
+    if (render_process_host) {
+      auto* persona_context = static_cast<ElectronBrowserContext*>(
+          render_process_host->GetBrowserContext());
+      if (persona_context && persona_context->agent_persona()) {
+        const auto* persona = persona_context->agent_persona();
+        command_line->AppendSwitchASCII(
+            switches::kAgentHardwareConcurrency,
+            base::NumberToString(persona->hardware_concurrency));
+        command_line->AppendSwitchASCII(switches::kAgentDeviceMemory,
+                                        persona->device_memory);
+        command_line->AppendSwitchASCII(switches::kAgentTimezone,
+                                        persona->timezone);
+      }
+    }
     content::WebContents* web_contents =
         GetWebContentsFromProcessID(unsafe_process_id);
     if (web_contents) {
@@ -1391,6 +1406,22 @@ blink::UserAgentMetadata ElectronBrowserClient::GetUserAgentMetadata() {
   return embedder_support::GetUserAgentMetadata();
 }
 
+void ElectronBrowserClient::OverrideUserAgentForBrowserContext(
+    content::BrowserContext* browser_context,
+    std::string* user_agent,
+    blink::UserAgentMetadata* metadata) {
+  // Shared workers and service workers ask the process-wide getter. A persona
+  // partition replaces that pair. Dedicated workers copy the document override
+  // and do not reach this method.
+  if (!browser_context || !user_agent || !metadata)
+    return;
+  auto* context = static_cast<ElectronBrowserContext*>(browser_context);
+  if (!context->agent_persona())
+    return;
+  *user_agent = context->agent_persona()->user_agent;
+  *metadata = context->GetAgentUserAgentMetadata();
+}
+
 mojo::PendingRemote<network::mojom::URLLoaderFactory>
 ElectronBrowserClient::CreateNonNetworkNavigationURLLoaderFactory(
     const std::string& scheme,
@@ -2055,6 +2086,17 @@ bool ElectronBrowserClient::ShouldUseSpareRenderProcessHost(
     std::optional<
         content::ContentBrowserClient::SpareProcessRefusedByEmbedderReason>&
         refused_reason) {
+  // A spare renderer is launched before it is bound to a persona, so it would
+  // miss the timezone and hardware switches.
+  if (browser_context) {
+    auto* persona_context =
+        static_cast<ElectronBrowserContext*>(browser_context);
+    if (persona_context->has_agent_persona()) {
+      refused_reason = content::ContentBrowserClient::
+          SpareProcessRefusedByEmbedderReason::DefaultDisabled;
+      return false;
+    }
+  }
   // Extension and WebUI (chrome://, devtools://) frames get renderer switches
   // and bindings of their own, whatever WebContents hosts them.
   if (

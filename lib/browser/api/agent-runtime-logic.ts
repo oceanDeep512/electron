@@ -13,10 +13,24 @@ export const checkpoint = Object.freeze({
   defaultActionTimeoutMs: 10_000,
   maxTimeoutMs: 120_000,
   controlPlane: true,
-  nativePersona: false,
+  // Per-surface truth. A false field is not applied.
+  nativePersona: {
+    userAgent: true,
+    clientHints: true,
+    acceptLanguages: true,
+    timezone: true,
+    hardwareConcurrency: true,
+    deviceMemory: true,
+    screen: false,
+    webgl: false,
+    webgpu: false,
+    canvas: false,
+    audio: false,
+    webrtc: false,
+    fonts: false
+  },
   // The snapshot API is wired to WebContents::RequestAXTreeSnapshot.
   // Response bodies are tee'd from the URL loader data pipe.
-  // WebSocket message bodies are not.
   accessibilitySnapshot: true,
   responseBodyObservation: true,
   webSocketMessageObservation: true
@@ -25,6 +39,8 @@ export const checkpoint = Object.freeze({
 export type AgentErrorCode =
   | 'invalid-persona'
   | 'native-persona-unavailable'
+  | 'persona-surface-unavailable'
+  | 'font-policy-unavailable'
   | 'invalid-partition'
   | 'partition-conflict'
   | 'partition-mismatch'
@@ -139,8 +155,8 @@ export function checkPartitionReuse(
   return 'reuse';
 }
 
-// Canonical JSON for a later native stage. createSession does not call this
-// and does not store the result.
+// Canonical JSON stored on the partition. createSession calls this. A later
+// request with a different id is partition-conflict.
 export function personaStorageId(persona: Persona): string {
   return JSON.stringify(persona);
 }
@@ -195,7 +211,7 @@ export interface Persona {
   timezone: string;
   hardwareConcurrency: number;
   deviceMemory: number;
-  screen: {
+  screen?: {
     width: number;
     height: number;
     availWidth: number;
@@ -203,8 +219,8 @@ export interface Persona {
     colorDepth: number;
     deviceScaleFactor: number;
   };
-  webgl: { vendor: string; renderer: string };
-  webgpu: { vendor: string; architecture: string; device: string; description: string };
+  webgl?: { vendor: string; renderer: string };
+  webgpu?: { vendor: string; architecture: string; device: string; description: string };
   webrtcIpHandlingPolicy:
     | 'default'
     | 'default_public_interface_only'
@@ -220,7 +236,8 @@ export type PersonaValidation =
 export type PersonaDecision =
   | { action: 'omit' }
   | { action: 'invalid'; errors: string[] }
-  | { action: 'unavailable'; persona: Persona };
+  | { action: 'unavailable'; persona: Persona; surfaces: string[] }
+  | { action: 'apply'; persona: Persona };
 
 const PERSONA_KEYS = [
   'seed',
@@ -301,11 +318,17 @@ export function validatePersona(value: unknown): PersonaValidation {
   if (typeof value.deviceMemory !== 'number' || !DEVICE_MEMORY_BUCKETS.has(value.deviceMemory)) {
     errors.push('deviceMemory must be one of 0.25, 0.5, 1, 2, 4, 8, 16, 32, 64');
   }
-  if (!WEBRTC_POLICIES.has(value.webrtcIpHandlingPolicy as string)) {
+  const webrtcPolicy = value.webrtcIpHandlingPolicy === undefined
+    ? 'default'
+    : value.webrtcIpHandlingPolicy;
+  if (!WEBRTC_POLICIES.has(webrtcPolicy as string)) {
     errors.push('webrtcIpHandlingPolicy is not one of the four existing Electron policies');
   }
-  if (value.fontPolicy !== 'real' && value.fontPolicy !== 'core') {
+  const fontPolicy = value.fontPolicy === undefined ? 'real' : value.fontPolicy;
+  if (fontPolicy !== 'real' && fontPolicy !== 'core') {
     errors.push("fontPolicy must be 'real' or 'core'");
+  } else if (fontPolicy === 'core') {
+    errors.push("fontPolicy 'core' is not implemented on this platform and is rejected");
   }
 
   let metadata: Persona['userAgentMetadata'] | null = null;
@@ -368,7 +391,9 @@ export function validatePersona(value: unknown): PersonaValidation {
   }
 
   let screen: Persona['screen'] | null = null;
-  if (!isRecord(value.screen)) {
+  if (value.screen === undefined) {
+    screen = undefined;
+  } else if (!isRecord(value.screen)) {
     errors.push('screen must be an object');
   } else {
     pushUnknown(errors, 'screen', value.screen, [
@@ -408,10 +433,16 @@ export function validatePersona(value: unknown): PersonaValidation {
     }
   }
 
-  const webgl = stringPair(value.webgl, 'webgl', ['vendor', 'renderer'], errors);
-  const webgpu = stringPair(value.webgpu, 'webgpu', ['vendor', 'architecture', 'device', 'description'], errors);
+  const webgl = value.webgl === undefined
+    ? undefined
+    : stringPair(value.webgl, 'webgl', ['vendor', 'renderer'], errors);
+  const webgpu = value.webgpu === undefined
+    ? undefined
+    : stringPair(value.webgpu, 'webgpu', ['vendor', 'architecture', 'device', 'description'], errors);
+  const webglOk = value.webgl === undefined || webgl !== null;
+  const webgpuOk = value.webgpu === undefined || webgpu !== null;
 
-  if (errors.length > 0 || !metadata || !screen || !webgl || !webgpu) {
+  if (errors.length > 0 || !metadata || (value.screen !== undefined && !screen) || !webglOk || !webgpuOk) {
     return { ok: false, errors };
   }
   return {
@@ -424,11 +455,11 @@ export function validatePersona(value: unknown): PersonaValidation {
       timezone: value.timezone as string,
       hardwareConcurrency: value.hardwareConcurrency as number,
       deviceMemory: value.deviceMemory as number,
-      screen,
-      webgl: webgl as Persona['webgl'],
-      webgpu: webgpu as Persona['webgpu'],
-      webrtcIpHandlingPolicy: value.webrtcIpHandlingPolicy as Persona['webrtcIpHandlingPolicy'],
-      fontPolicy: value.fontPolicy as Persona['fontPolicy']
+      ...(screen ? { screen } : {}),
+      ...(webgl ? { webgl: webgl as Persona['webgl'] } : {}),
+      ...(webgpu ? { webgpu: webgpu as Persona['webgpu'] } : {}),
+      webrtcIpHandlingPolicy: webrtcPolicy as Persona['webrtcIpHandlingPolicy'],
+      fontPolicy: fontPolicy as Persona['fontPolicy']
     }
   };
 }
@@ -465,8 +496,16 @@ export function decidePersona(persona: unknown): PersonaDecision {
   }
   const validated = validatePersona(persona);
   if (!validated.ok) return { action: 'invalid', errors: validated.errors };
-  // A valid config is still not applied. The native stage has to run first.
-  return { action: 'unavailable', persona: validated.persona };
+  const surfaces: string[] = [];
+  if (validated.persona.screen) surfaces.push('screen');
+  if (validated.persona.webgl) surfaces.push('webgl');
+  if (validated.persona.webgpu) surfaces.push('webgpu');
+  if (validated.persona.webrtcIpHandlingPolicy !== 'default') surfaces.push('webrtc');
+  // seed is stored for a later canvas stage and does not perturb pixels yet.
+  if (surfaces.length > 0) {
+    return { action: 'unavailable', persona: validated.persona, surfaces };
+  }
+  return { action: 'apply', persona: validated.persona };
 }
 
 export function assertTimeoutMs(value: unknown, fallback: number): number {

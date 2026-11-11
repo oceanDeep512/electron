@@ -1,6 +1,6 @@
 # Agent Runtime
 
-This page records the fourth checkpoint of the agent runtime. The control plane, accessibility snapshots, and HTTP response bodies remain, and page WebSocket messages can be observed from the session. Native fingerprint persona is still not implemented. The C++ for snapshots, response bodies, and WebSocket forwarding is source only: it has not been compiled or run.
+This page records the fifth checkpoint of the agent runtime. The control plane, accessibility snapshots, HTTP response bodies, and page WebSocket messages remain. A persona can now apply user agent, client hints metadata, accept languages, timezone, hardware concurrency, and device memory. Screen, graphics, canvas, audio, WebRTC, and fonts are still not applied. The C++ and the Chromium patches are source only: they have not been compiled or run.
 
 ## Status of this checkpoint
 
@@ -11,12 +11,12 @@ This page records the fourth checkpoint of the agent runtime. The control plane,
 | Public docs and generated TypeScript surface | `docs/api/agent-runtime.md` and `webContents.captureAccessibilitySnapshot` |
 | Navigation, locator, and input without CDP | Implemented, with the boundaries below |
 | Persona config validation | Implemented as a pure check |
-| Applying a fingerprint persona | Not implemented. `createSession` rejects a persona |
+| Applying a fingerprint persona | User agent, client hints metadata, accept languages, timezone, hardware concurrency, and device memory are wired. Screen, WebGL, WebGPU, canvas, audio, WebRTC, and `fontPolicy: "core"` are refused. Source only, not compiled |
 | Accessibility snapshot | Wired to `WebContents::RequestAXTreeSnapshot`. Source only, not compiled |
 | HTTP response body observation | Wired through `session.observeResponses()`. Source only, not compiled |
 | WebSocket message observation | Wired through `session.observeWebSockets()` for page and dedicated-worker sockets. Source only, not compiled |
 
-`electron.agentRuntime.checkpoint` exposes the same flags at runtime. `accessibilitySnapshot`, `responseBodyObservation`, and `webSocketMessageObservation` are true. `nativePersona` is false.
+`electron.agentRuntime.checkpoint` exposes the same flags at runtime. `accessibilitySnapshot`, `responseBodyObservation`, and `webSocketMessageObservation` are true. `nativePersona` is an object: user agent, client hints, accept languages, timezone, hardware concurrency, and device memory are true. Screen, WebGL, WebGPU, canvas, audio, WebRTC, and fonts are false.
 
 ## Pinned baseline
 
@@ -135,13 +135,27 @@ Incoming fragmentation follows `fin` and `WebSocketMessageType`. A message is em
 
 `wireCompressed` is true when the handshake extensions contain `permessage-deflate`. `WebSocketDeflateStream` inflates before `WebSocketChannel::HandleDataFrame`, and the renderer writes uncompressed bytes that the network service deflates on send. The observed payload is therefore the logical message. That reading is from the pinned sources above. It is not runtime-proven.
 
+## Persona surfaces in this checkpoint
+
+`createSession({ persona })` applies a persona only when every requested surface is implemented. `screen`, `webgl`, `webgpu`, and a non-default `webrtcIpHandlingPolicy` throw `persona-surface-unavailable` and do not call the native apply. `fontPolicy: "core"` throws `font-policy-unavailable`. `fontPolicy: "real"` and `webrtcIpHandlingPolicy: "default"` leave those stacks unchanged.
+
+The apply runs after `session.fromPartition` and before any page. It sets `NetworkContext::SetUserAgent` and `SetAcceptLanguage`, stores `blink::UserAgentMetadata` on the partition, and `WebContents::SetUserAgent` passes that metadata as `ua_metadata_override`. Chromium uses that override for the document user agent, `navigator.userAgentData`, and `Sec-CH-UA*`. `dedicated_worker.cc` at the pin copies `execution_context->UserAgent()` and `GetUserAgentMetadata()` into the worker, so a dedicated worker follows the document. Shared workers (`shared_worker_host.cc`) and service workers (`service_worker_version.cc`) call `ContentBrowserClient::GetUserAgent()` and `GetUserAgentMetadata()`. `patches/chromium/agent_persona_worker_user_agent.patch` adds `OverrideUserAgentForBrowserContext` and calls it with the worker's `BrowserContext`. Electron fills the user agent and metadata from the persona. That patch was checked with `git apply --check` against those three pinned files. It is not compiled.
+
+Timezone is checked with `icu::TimeZone::createTimeZone` in the browser and is not installed as the browser-process default. Renderer processes for that partition receive `--electron-agent-timezone`, `--electron-agent-hardware-concurrency`, and `--electron-agent-device-memory`. `RendererClientBase::RenderThreadStarted` calls `blink::TimeZoneController::SetTimeZoneOverride` and keeps the returned handle so the destructor does not clear it. The controller notifies V8 and worker threads in that process. A spare renderer is refused for a persona partition because it would have been launched without those switches.
+
+`hardwareConcurrency` and `deviceMemory` are read in Blink from those switches by `patches/chromium/agent_persona_renderer_hardware_overrides.patch`. The patch was checked with `git apply --check` against the Chromium `159.0.8140.0` copies of `navigator_concurrent_hardware.cc` and `navigator_device_memory.cc`. It does not call `SysInfo` when the switch is present, and it does not call `SetPhysicalMemoryMBForTesting`. Timezone and accept language use APIs already in this tree, so they were not patch-checked. HTTP `User-Agent` uses the existing `NetworkContext::SetUserAgent`. The worker user-agent patch is the second persona patch.
+
+Reusing an open partition with a different persona id throws `partition-conflict`. The native side also rejects a second id and rejects an apply after a page exists.
+
 ## Explicitly not implemented
 
 The following stay out of this checkpoint.
 
-*   Native persona application, including user agent and Client Hints, locale, timezone, hardware concurrency, device memory, screen, WebGL, WebGPU identity, canvas, audio, fonts, and WebRTC IP policy.
+*   Screen metrics, WebGL unmasked vendor/renderer, WebGPU adapter info, seeded canvas readback, audio readback perturbation, and WebRTC IP policy.
+*   `fontPolicy: "core"`. No platform font allowlist is installed, so the value is rejected.
+*   Finch, Widevine spoofing, and TLS or JA3 changes. None of those are part of the persona.
 *   Any claim that a persona is undetectable, or that codecs and Widevine are something other than what this build actually contains.
-*   A compiled or runtime-executed proof of the accessibility snapshot, the response-body tee, or the WebSocket forwarder. All three are source implementations.
+*   A compiled or runtime-executed proof of the accessibility snapshot, the response-body tee, the WebSocket forwarder, or the persona apply. All of them are source implementations.
 
 `build/args/all.gn` already sets proprietary codecs, Chrome ffmpeg branding, and Widevine flags. Those flags are unchanged here. A CDM is present only when its file exists. This checkpoint does not pretend otherwise.
 
@@ -163,20 +177,21 @@ Not run for this checkpoint, and not claimed:
 *   `e sync`, `gclient`, or a Chromium checkout. The WebSocket contracts were read from the public Chromium `159.0.8140.0` sources for `websocket.mojom`, `services/network/websocket.cc`, `net/websockets/websocket_channel.cc`, `net/websockets/websocket_deflate_stream.h`, `content/browser/websockets/websocket_connector_impl.cc`, and Blink `websocket_channel_impl.cc`. That reading is not a runtime proof.
 *   `e build` or any full Electron build
 *   `e test` or vitest under Electron
-*   `script/gen-filenames.mts`. Running it here would drop `node_header_sources`, because `../third_party/electron_node` and `../v8` are not checked out. The new structure doc was inserted into `filenames.auto.gni` in sorted order by hand. The new C++ files are listed in `filenames.gni`.
+*   `script/gen-filenames.mts`. Running it here would drop `node_header_sources`, because `../third_party/electron_node` and `../v8` are not checked out. `agent-persona.md`, `agent-persona-apply.md`, and `agent-persona-screen.md` were inserted into `filenames.auto.gni` in sorted order by hand. No new C++ file was added.
 
 `docs/api-history.schema.json` accepts `https://github.com/oceanDeep512/electron/pull/1` in addition to `electron/electron` pull requests. The history blocks use that fork pull request. No `electron/electron` pull request number was invented.
 
 This checkpoint ran:
 
-*   `node --experimental-strip-types --test spec/agent-runtime-logic.test.ts` — exit 0, 21 passed, 0 failed. This executes the production logic module, including response and WebSocket validation and delivery. It does not execute the C++ frame reassembly. Node prints `MODULE_TYPELESS_PACKAGE_JSON` because the logic file is TypeScript inside a package with no `"type"` field. That warning is left in place.
-*   `node node_modules/typescript/bin/tsc -p tsconfig.agent-runtime-logic.json --pretty false --noEmit` — exit 0. This project includes only the logic test and `lib/browser/api/agent-runtime-logic.ts`. It sets `types: ["node"]` so TypeScript 7 loads the real `@types/node`. It does not set `verbatimModuleSyntax`.
-*   `node node_modules/typescript/bin/tsc -p tsconfig.script.json --pretty false --noEmit` — exit 1, 190 errors. The output contains no `agent-runtime` path and no `TS1287`. The errors are pre-existing `script/` files that need `@types/node` and packages such as `@electron/get` and `@octokit/rest`.
+*   `node --experimental-strip-types --test spec/agent-runtime-logic.test.ts` — exit 0, 21 passed, 0 failed. Node prints `MODULE_TYPELESS_PACKAGE_JSON`. The test covers the persona decision. It does not execute C++.
+*   `node node_modules/typescript/lib/tsc.js -p tsconfig.agent-runtime-logic.json --pretty false --noEmit` — exit 0.
+*   `node node_modules/typescript/lib/tsc.js -p tsconfig.script.json --pretty false --noEmit` — exit 0, 0 errors. No `agent-runtime` path and no `TS1287`.
 *   `node --experimental-strip-types --check` on the logic module, the runtime module, the logic test, and `spec/api-agent-runtime.spec.ts` — exit 0. That is syntax only.
-*   `node script/create-api-json.mjs` — exit 0. `node node_modules/@electron/typescript-definitions/dist/bin.js --api=electron-api.json` — exit 0. `observeWebSockets`, `setWebSocketMessageObservation`, `updateResponseBodyObservationLimits`, and `WebSocketMessageObservation` are in the generated JSON and `electron.d.ts`. Those generated files are gitignored.
-*   `node spec/ts-smoke/runner.js` — exit 0. The fixture calls `observeResponses`, `observeWebSockets`, `setResponseBodyObservation`, `setWebSocketMessageObservation`, both limit updates, `captureAccessibilitySnapshot`, and `snapshot`, and keeps `@ts-expect-error` on string limits, missing listeners, and a missing partition.
-*   `node node_modules/typescript/bin/tsc -p tsconfig.electron.json --pretty false --noEmit` — exit 1, ten errors, all missing `@node/...` because `../third_party/electron_node` is not checked out. No error names an agent runtime file.
-*   `node node_modules/typescript/bin/tsc -p tsconfig.spec.json --pretty false --noEmit` — exit 1, 35 errors. No error names an agent runtime file. The errors are pre-existing missing spec dependencies (`protobufjs`, `busboy`, `ws`, `send`, and others). The typecheck used the installed `vitest` and `@types/node`. No stub module declarations were added.
-*   `node node_modules/@electron/lint-roller/dist/bin/lint-markdown-api-history.js` with the repo's history arguments — exit 0, 133 blocks, 0 errors. One pre-existing warning in `crash-reporter.md`.
+*   `node script/create-api-json.mjs` — exit 0. `node node_modules/@electron/typescript-definitions/dist/bin.js --api=electron-api.json` — exit 0. `nativePersona` is an object, and `setAgentPersona` is in the generated JSON and `electron.d.ts`. Those generated files are gitignored.
+*   `node spec/ts-smoke/runner.js` — exit 0.
+*   `node node_modules/typescript/lib/tsc.js -p tsconfig.electron.json --pretty false --noEmit` — exit 1, ten errors, all missing `@node/...` because `../third_party/electron_node` is not checked out. No error names an agent runtime file.
+*   `node node_modules/typescript/lib/tsc.js -p tsconfig.spec.json --pretty false --noEmit` — exit 0, 0 errors. `spec/api-agent-runtime.spec.ts` typechecks. It was not executed.
+*   `node node_modules/@electron/lint-roller/dist/bin/lint-markdown-api-history.js` with the repo's history arguments — exit 0, 134 blocks, 0 errors, 1 pre-existing warning in `crash-reporter.md`.
+*   `git apply --check` for `agent_persona_renderer_hardware_overrides.patch` against the pinned `navigator_concurrent_hardware.cc` and `navigator_device_memory.cc` — exit 0. `git apply --check` for `agent_persona_worker_user_agent.patch` against the pinned `service_worker_version.cc`, `shared_worker_host.cc`, and `content_browser_client.h` — exit 0. No other persona patch was checked, because timezone, accept language, and HTTP user agent use APIs already in this tree.
 
-oxlint is not installed in this environment. clang-format is not installed. `e build` and `e test` were not run. The C++ response-body tee, the WebSocket forwarder, and the accessibility snapshot binding are source only. `spec/api-agent-runtime.spec.ts` was not executed.
+oxlint is not installed in this environment. clang-format is not installed. `e build` and `e test` were not run. The C++ persona apply, the two Chromium patches, the response-body tee, the WebSocket forwarder, and the accessibility snapshot binding are source only. `spec/api-agent-runtime.spec.ts` was not executed.

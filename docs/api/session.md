@@ -1592,6 +1592,20 @@ session.defaultSession.allowNTLMCredentialsForDomains('*example.com, *foobar.com
 session.defaultSession.allowNTLMCredentialsForDomains('*')
 ```
 
+#### `ses.setAgentPersona(persona)`
+
+<!--
+```YAML history
+added:
+  - pr-url: https://github.com/oceanDeep512/electron/pull/1
+    description: "Added a session persona for user agent, language, timezone, and hardware."
+```
+-->
+
+* `persona` [AgentPersonaApply](structures/agent-persona-apply.md)
+
+Throws if this partition already has a page or a different persona. `agentRuntime.createSession({ persona })` is the supported caller. The metadata is the document `User-Agent` override, including `Sec-CH-UA*` on that override. Dedicated workers copy that override. Shared workers and service workers receive the same user agent and metadata through `OverrideUserAgentForBrowserContext`. Timezone, `hardwareConcurrency`, and `deviceMemory` are delivered only to this session's renderer processes.
+
 #### `ses.setUserAgent(userAgent[, acceptLanguages])`
 
 * `userAgent` string

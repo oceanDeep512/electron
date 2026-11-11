@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -22,6 +23,7 @@
 #include "services/network/public/mojom/ssl_config.mojom.h"
 #include "services/network/public/mojom/url_loader_factory.mojom.h"
 #include "third_party/blink/public/common/permissions/permission_utils.h"
+#include "third_party/blink/public/common/user_agent/user_agent_metadata.h"
 
 class PrefService;
 class ValueMapPrefStore;
@@ -91,6 +93,37 @@ class ElectronBrowserContext : public content::BrowserContext {
 
   void SetUserAgent(const std::string& user_agent);
   std::string GetUserAgent() const;
+
+  // Values applied to this partition before its first renderer. The browser
+  // process ICU default is not changed.
+  struct AgentPersona {
+    std::string id;
+    std::string user_agent;
+    std::string accept_languages;
+    std::string timezone;
+    int hardware_concurrency = 0;
+    std::string device_memory;
+    std::string full_version;
+    std::string platform;
+    std::string platform_version;
+    std::string architecture;
+    std::string bitness;
+    std::string model;
+    bool mobile = false;
+    bool wow64 = false;
+    std::vector<std::pair<std::string, std::string>> brands;
+    std::vector<std::pair<std::string, std::string>> full_version_list;
+    std::vector<std::string> form_factors;
+  };
+
+  // Empty string on success. A non-empty string is a caller error.
+  std::string ApplyAgentPersona(AgentPersona persona);
+  bool has_agent_persona() const { return agent_persona_.has_value(); }
+  // Empty when this partition has no persona.
+  blink::UserAgentMetadata GetAgentUserAgentMetadata() const;
+  const AgentPersona* agent_persona() const {
+    return agent_persona_ ? &agent_persona_.value() : nullptr;
+  }
   bool can_use_http_cache() const { return use_cache_; }
   int max_cache_size() const { return max_cache_size_; }
   ResolveProxyHelper* GetResolveProxyHelper();
@@ -230,6 +263,7 @@ class ElectronBrowserContext : public content::BrowserContext {
   std::unique_ptr<ProtocolRegistry> protocol_registry_;
 
   std::optional<std::string> user_agent_;
+  std::optional<AgentPersona> agent_persona_;
   base::FilePath path_;
   bool in_memory_ = false;
   bool use_cache_ = true;

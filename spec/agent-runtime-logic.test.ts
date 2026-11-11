@@ -103,11 +103,23 @@ function validPersona(extra: Record<string, unknown> = {}): Record<string, unkno
   };
 }
 
-test('checkpoint records the pinned baseline and leaves persona off', () => {
+test('checkpoint records the pinned baseline and per-surface persona flags', () => {
   assert.equal(checkpoint.baseline, 'ef2710fa6c10fe56365a9949fa783d26ca1499e5');
   assert.equal(checkpoint.chromium, '159.0.8140.0');
   assert.equal(checkpoint.controlPlane, true);
-  assert.equal(checkpoint.nativePersona, false);
+  assert.equal(checkpoint.nativePersona.userAgent, true);
+  assert.equal(checkpoint.nativePersona.clientHints, true);
+  assert.equal(checkpoint.nativePersona.acceptLanguages, true);
+  assert.equal(checkpoint.nativePersona.timezone, true);
+  assert.equal(checkpoint.nativePersona.hardwareConcurrency, true);
+  assert.equal(checkpoint.nativePersona.deviceMemory, true);
+  assert.equal(checkpoint.nativePersona.screen, false);
+  assert.equal(checkpoint.nativePersona.webgl, false);
+  assert.equal(checkpoint.nativePersona.webgpu, false);
+  assert.equal(checkpoint.nativePersona.canvas, false);
+  assert.equal(checkpoint.nativePersona.audio, false);
+  assert.equal(checkpoint.nativePersona.webrtc, false);
+  assert.equal(checkpoint.nativePersona.fonts, false);
   assert.equal(checkpoint.accessibilitySnapshot, true);
   assert.equal(checkpoint.responseBodyObservation, true);
   assert.equal(checkpoint.webSocketMessageObservation, true);
@@ -167,7 +179,7 @@ test('an open partition is not reused with a different persona or persistence', 
   );
 });
 
-test('a valid persona is rejected as unavailable and is not treated as applied', () => {
+test('implemented persona surfaces apply and the rest are refused', () => {
   assert.deepEqual(decidePersona(undefined), { action: 'omit' });
   const missing = decidePersona(null);
   assert.equal(missing.action, 'invalid');
@@ -182,16 +194,38 @@ test('a valid persona is rejected as unavailable and is not treated as applied',
     }
   }));
   assert.equal(emptyVersion.ok, false);
+  const fontCore = decidePersona(validPersona({ fontPolicy: 'core', screen: undefined, webgl: undefined, webgpu: undefined, webrtcIpHandlingPolicy: 'default' }));
+  assert.equal(fontCore.action, 'invalid');
+  if (fontCore.action === 'invalid') {
+    assert.equal(fontCore.errors.some((error) => error.includes("fontPolicy 'core'")), true);
+  }
   const validated = validatePersona(validPersona());
   assert.equal(validated.ok, true);
   if (!validated.ok) return;
   const decision = decidePersona(validPersona());
   assert.equal(decision.action, 'unavailable');
   if (decision.action !== 'unavailable') return;
+  assert.deepEqual(decision.surfaces, ['screen', 'webgl', 'webgpu', 'webrtc']);
   assert.equal(decision.persona.userAgentMetadata.model, '');
   assert.equal(personaStorageId(decision.persona), personaStorageId(validated.persona));
   const again = JSON.parse(personaStorageId(decision.persona)) as Persona;
   assert.equal(personaStorageId(again), personaStorageId(decision.persona));
+
+  const minimal = validPersona({
+    screen: undefined,
+    webgl: undefined,
+    webgpu: undefined,
+    webrtcIpHandlingPolicy: 'default'
+  });
+  delete minimal.screen;
+  delete minimal.webgl;
+  delete minimal.webgpu;
+  const applied = decidePersona(minimal);
+  assert.equal(applied.action, 'apply');
+  if (applied.action !== 'apply') return;
+  assert.equal(applied.persona.screen, undefined);
+  assert.equal(applied.persona.fontPolicy, 'real');
+  assert.equal(applied.persona.webrtcIpHandlingPolicy, 'default');
 });
 
 test('http status is taken only from a real did-navigate code', () => {

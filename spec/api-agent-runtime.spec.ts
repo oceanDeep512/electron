@@ -1,4 +1,4 @@
-import { agentRuntime, BrowserWindow } from 'electron/main';
+import { agentRuntime, BrowserWindow, type AgentPersona } from 'electron/main';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -23,7 +23,7 @@ function partitionName(): string {
   return `agentrt${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function createSession(options: { partition?: string; persist?: boolean; persona?: unknown } = {}): AgentSession {
+function createSession(options: { partition?: string; persist?: boolean; persona?: AgentPersona } = {}): AgentSession {
   const created = agentRuntime.createSession({
     partition: options.partition ?? partitionName(),
     persist: options.persist,
@@ -41,7 +41,7 @@ function errorCode(error: unknown): string | undefined {
   return undefined;
 }
 
-function samplePersona(): Record<string, unknown> {
+function samplePersona(): AgentPersona {
   return {
     seed: 'seed-1',
     userAgent: 'Mozilla/5.0 AgentRuntime',
@@ -103,12 +103,15 @@ afterEach(async () => {
 });
 
 describe('agentRuntime checkpoint', () => {
-  it('exposes the control plane and leaves websocket and persona off', () => {
+  it('exposes the control plane and the persona surfaces that are wired', () => {
     expect(agentRuntime.checkpoint.controlPlane).toBe(true);
-    expect(agentRuntime.checkpoint.nativePersona).toBe(false);
+    expect(agentRuntime.checkpoint.nativePersona.userAgent).toBe(true);
+    expect(agentRuntime.checkpoint.nativePersona.timezone).toBe(true);
+    expect(agentRuntime.checkpoint.nativePersona.screen).toBe(false);
+    expect(agentRuntime.checkpoint.nativePersona.fonts).toBe(false);
     expect(agentRuntime.checkpoint.accessibilitySnapshot).toBe(true);
     expect(agentRuntime.checkpoint.responseBodyObservation).toBe(true);
-    expect(agentRuntime.checkpoint.webSocketMessageObservation).toBe(false);
+    expect(agentRuntime.checkpoint.webSocketMessageObservation).toBe(true);
     expect(agentRuntime.checkpoint.baseline).toBe('ef2710fa6c10fe56365a9949fa783d26ca1499e5');
     expect('snapshot' in agentRuntime).toBe(false);
     expect('observe' in agentRuntime).toBe(false);
@@ -136,19 +139,53 @@ describe('agentRuntime checkpoint', () => {
     const partition = partitionName();
     try {
       agentRuntime.createSession({ partition, persona });
-      expect.fail('persona should be unavailable');
+      expect.fail('unimplemented surfaces should be refused');
     } catch (error) {
-      expect(errorCode(error)).toBe('native-persona-unavailable');
+      expect(errorCode(error)).toBe('persona-surface-unavailable');
     }
     try {
+      // @ts-expect-error a seed by itself is not a persona
       agentRuntime.createSession({ partition, persona: { seed: 'only' } });
       expect.fail('invalid persona should be rejected');
     } catch (error) {
       expect(errorCode(error)).toBe('invalid-persona');
     }
+    const core = samplePersona();
+    delete core.screen;
+    delete core.webgl;
+    delete core.webgpu;
+    core.webrtcIpHandlingPolicy = 'default';
+    core.fontPolicy = 'core';
+    try {
+      agentRuntime.createSession({ partition, persona: core });
+      expect.fail('fontPolicy core should be rejected');
+    } catch (error) {
+      expect(errorCode(error)).toBe('font-policy-unavailable');
+    }
     const created = createSession({ partition });
     expect(created.personaApplied).toBe(false);
     expect(created.personaId).toBe(null);
+  });
+
+  it('applies the implemented persona surfaces and refuses a different persona on the same partition', () => {
+    const persona = samplePersona();
+    delete persona.screen;
+    delete persona.webgl;
+    delete persona.webgpu;
+    persona.webrtcIpHandlingPolicy = 'default';
+    persona.fontPolicy = 'real';
+    const partition = partitionName();
+    const created = createSession({ partition, persona });
+    expect(created.personaApplied).toBe(true);
+    expect(typeof created.personaId).toBe('string');
+    expect(agentRuntime.createSession({ partition, persona })).toBe(created);
+    const other = samplePersona();
+    delete other.screen;
+    delete other.webgl;
+    delete other.webgpu;
+    other.webrtcIpHandlingPolicy = 'default';
+    other.userAgent = 'Mozilla/5.0 Other';
+    expect(() => agentRuntime.createSession({ partition, persona: other })).toThrow();
   });
 
   it('reuses an open session and isolates cookies by partition', async () => {

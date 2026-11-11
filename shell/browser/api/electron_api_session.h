@@ -143,6 +143,7 @@ class Session final : public gin::Wrappable<Session>,
   v8::Local<v8::Promise> ClearAuthCache();
   void AllowNTLMCredentialsForDomains(const std::string& domains);
   void SetUserAgent(const std::string& user_agent, gin::Arguments* args);
+  void SetAgentPersona(gin::Arguments* args);
   std::string GetUserAgent();
   void SetSSLConfig(network::mojom::SSLConfigPtr config);
   bool IsPersistent();

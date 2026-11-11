@@ -139,6 +139,10 @@ class ElectronBrowserClient : public content::ContentBrowserClient,
   std::string GetUserAgent() override;
   void SetUserAgent(const std::string& user_agent);
   blink::UserAgentMetadata GetUserAgentMetadata() override;
+  void OverrideUserAgentForBrowserContext(
+      content::BrowserContext* browser_context,
+      std::string* user_agent,
+      blink::UserAgentMetadata* metadata) override;
 
   content::SerialDelegate* GetSerialDelegate() override;
 

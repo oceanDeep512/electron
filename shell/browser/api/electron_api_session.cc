@@ -1353,6 +1353,119 @@ void Session::AllowNTLMCredentialsForDomains(const std::string& domains) {
       std::move(auth_dynamic_params));
 }
 
+bool ReadBrandList(v8::Isolate* isolate,
+                   v8::Local<v8::Value> value,
+                   std::vector<std::pair<std::string, std::string>>* out,
+                   std::string* error) {
+  if (!value->IsArray()) {
+    *error = "brand list must be an array";
+    return false;
+  }
+  auto array = value.As<v8::Array>();
+  if (array->Length() < 1 || array->Length() > 8) {
+    *error = "brand list must contain 1 to 8 entries";
+    return false;
+  }
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  for (uint32_t i = 0; i < array->Length(); ++i) {
+    v8::Local<v8::Value> entry;
+    if (!array->Get(context, i).ToLocal(&entry) || !entry->IsObject()) {
+      *error = "brand entries must be objects";
+      return false;
+    }
+    gin_helper::Dictionary dict(isolate, entry.As<v8::Object>());
+    std::string brand;
+    std::string version;
+    if (!dict.Get("brand", &brand) || !dict.Get("version", &version) ||
+        brand.empty() || version.empty()) {
+      *error = "brand entries need brand and version";
+      return false;
+    }
+    out->emplace_back(std::move(brand), std::move(version));
+  }
+  return true;
+}
+
+std::string DeviceMemorySwitch(double value) {
+  if (value == 0.25)
+    return "0.25";
+  if (value == 0.5)
+    return "0.5";
+  if (value == 1)
+    return "1";
+  if (value == 2)
+    return "2";
+  if (value == 4)
+    return "4";
+  if (value == 8)
+    return "8";
+  if (value == 16)
+    return "16";
+  if (value == 32)
+    return "32";
+  if (value == 64)
+    return "64";
+  return std::string();
+}
+
+void Session::SetAgentPersona(gin::Arguments* args) {
+  v8::Isolate* isolate = args->isolate();
+  gin_helper::Dictionary options;
+  if (!args->GetNext(&options)) {
+    args->ThrowTypeError("persona options are required");
+    return;
+  }
+  ElectronBrowserContext::AgentPersona persona;
+  if (!options.Get("id", &persona.id) || persona.id.empty() ||
+      !options.Get("userAgent", &persona.user_agent) ||
+      persona.user_agent.empty() ||
+      !options.Get("acceptLanguages", &persona.accept_languages) ||
+      persona.accept_languages.empty() ||
+      !options.Get("timezone", &persona.timezone) || persona.timezone.empty() ||
+      !options.Get("hardwareConcurrency", &persona.hardware_concurrency) ||
+      !options.Get("fullVersion", &persona.full_version) ||
+      !options.Get("platform", &persona.platform) ||
+      !options.Get("platformVersion", &persona.platform_version) ||
+      !options.Get("architecture", &persona.architecture) ||
+      !options.Get("bitness", &persona.bitness) ||
+      !options.Get("model", &persona.model) ||
+      !options.Get("mobile", &persona.mobile) ||
+      !options.Get("wow64", &persona.wow64) ||
+      !options.Get("formFactors", &persona.form_factors) ||
+      persona.form_factors.empty()) {
+    args->ThrowTypeError("persona is missing a required field");
+    return;
+  }
+  double device_memory = 0;
+  if (!options.Get("deviceMemory", &device_memory)) {
+    args->ThrowTypeError("deviceMemory must be a number");
+    return;
+  }
+  persona.device_memory = DeviceMemorySwitch(device_memory);
+  if (persona.device_memory.empty() || persona.hardware_concurrency < 1 ||
+      persona.hardware_concurrency > 1024) {
+    args->ThrowTypeError("hardwareConcurrency or deviceMemory is out of range");
+    return;
+  }
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  v8::Local<v8::Object> handle = options.GetHandle();
+  v8::Local<v8::Value> brands;
+  v8::Local<v8::Value> full_versions;
+  std::string error;
+  if (!handle->Get(context, gin::StringToV8(isolate, "brands")).ToLocal(&brands) ||
+      !ReadBrandList(isolate, brands, &persona.brands, &error) ||
+      !handle->Get(context, gin::StringToV8(isolate, "fullVersionList"))
+           .ToLocal(&full_versions) ||
+      !ReadBrandList(isolate, full_versions, &persona.full_version_list,
+                     &error)) {
+    args->ThrowTypeError(error.empty() ? "brand list is invalid" : error);
+    return;
+  }
+  error = browser_context_->ApplyAgentPersona(std::move(persona));
+  if (!error.empty())
+    args->ThrowTypeError(error);
+}
+
 void Session::SetUserAgent(const std::string& user_agent,
                            gin::Arguments* args) {
   browser_context_->SetUserAgent(user_agent);
@@ -2194,6 +2307,7 @@ void Session::FillObjectTemplate(v8::Isolate* isolate,
           "allowNTLMCredentialsForDomains")
       .SetMethod<&Session::IsPersistent>("isPersistent")
       .SetMethod<&Session::SetUserAgent>("setUserAgent")
+      .SetMethod<&Session::SetAgentPersona>("setAgentPersona")
       .SetMethod<&Session::GetUserAgent>("getUserAgent")
       .SetMethod<&Session::SetSSLConfig>("setSSLConfig")
       .SetMethod<&Session::GetBlobData>("getBlobData")

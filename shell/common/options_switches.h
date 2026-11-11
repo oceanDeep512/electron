@@ -331,6 +331,14 @@ inline constexpr base::cstring_view kEnableAuthNegotiatePort =
 // If set, NTLM v2 is disabled for POSIX platforms.
 inline constexpr base::cstring_view kDisableNTLMv2 = "disable-ntlm-v2";
 
+// Agent persona values for one session's renderer processes. The browser
+// process does not apply these switches to itself.
+inline constexpr base::cstring_view kAgentHardwareConcurrency =
+    "electron-agent-hardware-concurrency";
+inline constexpr base::cstring_view kAgentDeviceMemory =
+    "electron-agent-device-memory";
+inline constexpr base::cstring_view kAgentTimezone = "electron-agent-timezone";
+
 }  // namespace switches
 
 }  // namespace electron

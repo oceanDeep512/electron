@@ -5,6 +5,9 @@
 added:
   - pr-url: https://github.com/oceanDeep512/electron/pull/1
     description: "Added a main-process agentRuntime control plane and accessibility snapshots."
+changes:
+  - pr-url: https://github.com/oceanDeep512/electron/pull/1
+    description: "Applied user agent, language, timezone, and hardware persona surfaces."
 ```
 -->
 
@@ -13,10 +16,11 @@ added:
 Process: [Main](../glossary.md#main-process)
 
 `agentRuntime` creates named partitions and drives pages without the debugger.
-It does not change webPreferences of a page it did not create. Native fingerprint
-personas, HTTP response bodies, and WebSocket message bodies are not implemented.
-Passing a persona throws `native-persona-unavailable` and does not call
-`session.fromPartition`.
+It does not change webPreferences of a page it did not create. A persona applies
+user agent, client hints metadata, accept languages, timezone, hardware concurrency,
+and device memory, including dedicated workers, shared workers, and service
+workers. Screen, WebGL, WebGPU, canvas, audio, WebRTC policy, and font
+policy `core` are not applied.
 
 ```js
 const { agentRuntime } = require('electron')
@@ -44,7 +48,20 @@ An `Object` frozen record of the pinned baseline and which stages are present in
 * `defaultActionTimeoutMs` Integer
 * `maxTimeoutMs` Integer
 * `controlPlane` boolean - `true` when session and page control is present.
-* `nativePersona` boolean - `false`. A persona is not applied.
+* `nativePersona` Object - Which persona surfaces this build applies.
+  * `userAgent` boolean - `true` for the document user-agent string and HTTP `User-Agent`.
+  * `clientHints` boolean - `true` for `navigator.userAgentData` and the `Sec-CH-UA*` metadata on that document override.
+  * `acceptLanguages` boolean - `true` for the network `Accept-Language` header and renderer `navigator.languages`.
+  * `timezone` boolean - `true` for that session's renderer processes, including their workers.
+  * `hardwareConcurrency` boolean
+  * `deviceMemory` boolean
+  * `screen` boolean - `false`.
+  * `webgl` boolean - `false`.
+  * `webgpu` boolean - `false`.
+  * `canvas` boolean - `false`. The seed is stored and does not change pixels.
+  * `audio` boolean - `false`.
+  * `webrtc` boolean - `false`. Only `default` is accepted.
+  * `fonts` boolean - `false`. `fontPolicy: "core"` is rejected.
 * `accessibilitySnapshot` boolean - `true` when `page.snapshot()` is wired to `WebContents::RequestAXTreeSnapshot`.
 * `responseBodyObservation` boolean - `true` when `session.observeResponses()` is wired to the URL loader tee.
 * `webSocketMessageObservation` boolean - `true` when `session.observeWebSockets()` is wired to the WebSocket forwarder.
@@ -52,7 +69,7 @@ An `Object` frozen record of the pinned baseline and which stages are present in
 ### `agentRuntime.AgentRuntimeError` _Readonly_
 
 An `Error` subclass thrown by this module. `error.code` is a string such as
-`invalid-partition`, `native-persona-unavailable`, `timeout`, `aborted`,
+`invalid-partition`, `persona-surface-unavailable`, `font-policy-unavailable`, `timeout`, `aborted`,
 `navigation-failed`, or `snapshot-failed`.
 
 ## Methods
@@ -62,11 +79,11 @@ An `Error` subclass thrown by this module. `error.code` is a string such as
 * `options` Object
   * `partition` string - Required partition name. Must not be empty. An empty string is rejected so this method never uses the default session.
   * `persist` boolean (optional) - When omitted, a `persist:` prefix means persistent storage and a bare name means in-memory storage.
-  * `persona` any (optional) - Must be omitted. An object fails with `native-persona-unavailable` before the partition is reserved. `null` is invalid.
+  * `persona` [AgentPersona](structures/agent-persona.md) (optional) - Applies the implemented surfaces before the partition's first page. `null` is invalid. `screen`, `webgl`, `webgpu`, and a non-default `webrtcIpHandlingPolicy` fail with `persona-surface-unavailable` and apply nothing. `fontPolicy: "core"` fails with `font-policy-unavailable`.
 
 Returns [`AgentSession`](agent-runtime.md#class-agentsession)
 
-Reuses the open handle when the same storage partition is requested with the same persistence and a null persona id. A different `persist` value throws `partition-conflict`.
+Reuses the open handle when the same storage partition is requested with the same persistence and the same persona id. A different `persist` value or a different persona throws `partition-conflict`.
 
 ### `agentRuntime.resolvePartition(options)`
 
@@ -86,11 +103,11 @@ Throws the same partition errors as `createSession` and does not create a sessio
 
 * `persona` any
 
-Returns `Object` - A shape check only. A successful result does not change a renderer, the network stack, Client Hints, timezone, WebGL, canvas, audio, fonts, or WebRTC.
+Returns `Object` - A shape check only. A successful result does not by itself change a renderer. `createSession` performs the native apply.
 
 * `ok` boolean
 * `errors` string[] (optional) - Present when `ok` is false.
-* `persona` Object (optional) - Present when `ok` is true.
+* `persona` [AgentPersona](structures/agent-persona.md) (optional) - Present when `ok` is true.
 
 ## Class: AgentSession
 
@@ -102,11 +119,11 @@ does not destroy an adopted `WebContents`.
 
 #### `session.personaApplied` _Readonly_
 
-A `boolean`. Always `false` in this build. No persona is stored or applied.
+A `boolean`. `true` after this handle applied a persona to the partition.
 
 #### `session.personaId` _Readonly_
 
-A `null`. Always null in this build.
+A `string | null` - Canonical persona identity when a persona was applied. `null` when the session has no persona. Closing the handle does not clear the partition's persona.
 
 #### `session.persist` _Readonly_
 
