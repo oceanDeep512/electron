@@ -4,6 +4,7 @@
 
 #include "shell/browser/net/url_loader_factory_gate.h"
 
+#include <memory>
 #include <optional>
 #include <utility>
 
@@ -27,6 +28,7 @@
 #include "services/network/public/mojom/url_response_head.mojom.h"
 #include "shell/browser/api/electron_api_web_request.h"
 #include "shell/browser/electron_browser_context.h"
+#include "shell/browser/net/response_body_observer.h"
 #include "url/gurl.h"
 
 namespace electron {
@@ -82,7 +84,6 @@ WebRequestResourceType ResourceTypeOf(const network::ResourceRequest& request) {
 }
 
 InterceptState::InterceptState() = default;
-InterceptState::~InterceptState() = default;
 
 void InterceptState::SetListenerTypes(uint32_t blocking_types,
                                       uint32_t observer_types) {
@@ -140,6 +141,7 @@ class ObservedURLLoader : public network::mojom::URLLoader,
  public:
   ObservedURLLoader(
       base::WeakPtr<ElectronBrowserContext> browser_context,
+      scoped_refptr<InterceptState> state,
       int render_process_id,
       int frame_routing_id,
       const network::ResourceRequest& request,
@@ -147,6 +149,10 @@ class ObservedURLLoader : public network::mojom::URLLoader,
       mojo::PendingRemote<network::mojom::URLLoaderClient> renderer_client,
       network::mojom::URLLoaderClientEndpointsPtr network_endpoints)
       : browser_context_(std::move(browser_context)),
+        response_body_(state && state->response_body_enabled()
+                           ? ResponseBodyFollow::MaybeCreate(state.get(),
+                                                             request.url)
+                           : nullptr),
         render_process_id_(render_process_id),
         frame_routing_id_(frame_routing_id),
         key_(g_observed_request_key.GetNext()),
@@ -220,6 +226,10 @@ class ObservedURLLoader : public network::mojom::URLLoader,
       mojo::ScopedDataPipeConsumerHandle body,
       std::optional<mojo_base::BigBuffer> cached_metadata) override {
     auto head_for_ui = head.Clone();
+    if (response_body_) {
+      body = response_body_->OnResponse(head.get(), request_.url.spec(),
+                                        std::move(body));
+    }
     renderer_client_->OnReceiveResponse(std::move(head), std::move(body),
                                         std::move(cached_metadata));
     UIThread()->PostTask(
@@ -232,6 +242,8 @@ class ObservedURLLoader : public network::mojom::URLLoader,
     DCHECK(!pending_redirect_);
     pending_redirect_ = redirect_info;
     auto head_for_ui = head.Clone();
+    if (response_body_)
+      response_body_->OnRedirect(request_.url.spec(), redirect_info);
     renderer_client_->OnReceiveRedirect(redirect_info, std::move(head));
     UIThread()->PostTask(
         FROM_HERE, base::BindOnce(&api::WebRequest::ObservedRequestRedirected,
@@ -248,6 +260,8 @@ class ObservedURLLoader : public network::mojom::URLLoader,
     renderer_client_->OnTransferSizeUpdated(transfer_size_diff);
   }
   void OnComplete(const network::URLLoaderCompletionStatus& status) override {
+    if (response_body_)
+      response_body_->OnNetworkComplete(status.error_code);
     renderer_client_->OnComplete(status);
     Finish(status);
   }
@@ -263,6 +277,7 @@ class ObservedURLLoader : public network::mojom::URLLoader,
   }
 
   const base::WeakPtr<ElectronBrowserContext> browser_context_;
+  const std::unique_ptr<ResponseBodyFollow> response_body_;
   const int render_process_id_;
   const int frame_routing_id_;
   const uint64_t key_;
@@ -277,6 +292,7 @@ class ObservedURLLoader : public network::mojom::URLLoader,
 
 void CreateObservedLoaderAndStart(
     base::WeakPtr<ElectronBrowserContext> browser_context,
+    scoped_refptr<InterceptState> state,
     int render_process_id,
     int frame_routing_id,
     mojo::PendingReceiver<network::mojom::URLLoader> loader,
@@ -293,7 +309,8 @@ void CreateObservedLoaderAndStart(
   auto network_endpoints = network::mojom::URLLoaderClientEndpoints::New(
       std::move(network_loader),
       network_client.InitWithNewPipeAndPassReceiver());
-  new ObservedURLLoader(std::move(browser_context), render_process_id,
+  new ObservedURLLoader(std::move(browser_context), std::move(state),
+                        render_process_id,
                         frame_routing_id, request, std::move(loader),
                         std::move(client), std::move(network_endpoints));
   target->CreateLoaderAndStart(std::move(network_loader_receiver), request_id,
@@ -344,11 +361,21 @@ class URLLoaderFactoryGate : public network::SelfDeletingURLLoaderFactory {
         return;
       case InterceptState::Route::kObserve:
         CreateObservedLoaderAndStart(
-            browser_context_, render_process_id_, frame_routing_id_,
+            browser_context_, state_, render_process_id_, frame_routing_id_,
             std::move(loader), request_id, options, request, std::move(client),
             traffic_annotation, target_.get());
         return;
       case InterceptState::Route::kDirect:
+        if (state_->response_body_enabled()) {
+          std::unique_ptr<ResponseBodyFollow> follow =
+              ResponseBodyFollow::MaybeCreate(state_.get(), request.url);
+          if (follow) {
+            StartResponseBodyLoader(
+                std::move(follow), std::move(loader), request_id, options,
+                request, std::move(client), traffic_annotation, target_.get());
+            return;
+          }
+        }
         target_->CreateLoaderAndStart(std::move(loader), request_id, options,
                                       request, std::move(client),
                                       traffic_annotation);
@@ -371,6 +398,7 @@ class URLLoaderFactoryGate : public network::SelfDeletingURLLoaderFactory {
 
 void CreateObservedLoaderAndStartOnIO(
     base::WeakPtr<ElectronBrowserContext> browser_context,
+    scoped_refptr<InterceptState> state,
     int render_process_id,
     int frame_routing_id,
     mojo::PendingReceiver<network::mojom::URLLoader> loader,
@@ -384,7 +412,8 @@ void CreateObservedLoaderAndStartOnIO(
       FROM_HERE,
       base::BindOnce(
           [](base::WeakPtr<ElectronBrowserContext> browser_context,
-             int render_process_id, int frame_routing_id,
+             scoped_refptr<InterceptState> state, int render_process_id,
+             int frame_routing_id,
              mojo::PendingReceiver<network::mojom::URLLoader> loader,
              int32_t request_id, uint32_t options,
              network::ResourceRequest request,
@@ -394,13 +423,14 @@ void CreateObservedLoaderAndStartOnIO(
             mojo::Remote<network::mojom::URLLoaderFactory> target_remote(
                 std::move(target));
             CreateObservedLoaderAndStart(
-                std::move(browser_context), render_process_id, frame_routing_id,
-                std::move(loader), request_id, options, request,
-                std::move(client), traffic_annotation, target_remote.get());
+                std::move(browser_context), std::move(state), render_process_id,
+                frame_routing_id, std::move(loader), request_id, options,
+                request, std::move(client), traffic_annotation,
+                target_remote.get());
           },
-          std::move(browser_context), render_process_id, frame_routing_id,
-          std::move(loader), request_id, options, request, std::move(client),
-          traffic_annotation, std::move(target)));
+          std::move(browser_context), std::move(state), render_process_id,
+          frame_routing_id, std::move(loader), request_id, options, request,
+          std::move(client), traffic_annotation, std::move(target)));
 }
 
 void CreateURLLoaderFactoryGate(

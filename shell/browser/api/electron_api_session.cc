@@ -80,6 +80,9 @@
 #include "shell/browser/javascript_environment.h"
 #include "shell/browser/media/media_device_id_salt.h"
 #include "shell/browser/net/cert_verifier_client.h"
+#include "shell/browser/net/response_body_observer.h"
+#include "shell/browser/net/websocket_message_observer.h"
+#include "shell/browser/net/url_loader_factory_gate.h"
 #include "shell/browser/net/resolve_host_function.h"
 #include "shell/browser/net/resolve_proxy_helper.h"
 #include "shell/browser/session_preferences.h"
@@ -624,6 +627,10 @@ Session::Session(v8::Isolate* isolate, ElectronBrowserContext* browser_context)
 }
 
 Session::~Session() {
+  if (browser_context_ && browser_context_->intercept_state()) {
+    browser_context_->intercept_state()->ClearResponseBodyObservation();
+    browser_context_->intercept_state()->ClearWebSocketObservation();
+  }
   Dispose();
 }
 
@@ -954,6 +961,285 @@ void Session::SetPermissionRequestHandler(v8::Local<v8::Value> val,
       base::Owned(std::move(handler))));
 }
 
+void Session::SetResponseBodyObservation(v8::Local<v8::Value> listener,
+                                         gin::Arguments* args) {
+  if (!browser_context_ || !browser_context_->intercept_state()) {
+    args->ThrowTypeError("The session has been destroyed");
+    return;
+  }
+  InterceptState* state = browser_context_->intercept_state();
+  if (listener->IsNull() || listener->IsUndefined()) {
+    state->ClearResponseBodyObservation();
+    return;
+  }
+  if (!listener->IsFunction()) {
+    args->ThrowTypeError("Must pass null or a function");
+    return;
+  }
+
+  ResponseBodyLimits limits;
+  v8::Local<v8::Value> options;
+  if (args->GetNext(&options) && !options->IsNullOrUndefined()) {
+    if (!options->IsObject()) {
+      args->ThrowTypeError("Response observation options must be an object");
+      return;
+    }
+    gin_helper::Dictionary dict(args->isolate(), options.As<v8::Object>());
+    if (dict.Has("urls")) {
+      std::vector<std::string> urls;
+      if (!dict.Get("urls", &urls) || urls.size() > 32) {
+        args->ThrowTypeError("urls must be an array of at most 32 strings");
+        return;
+      }
+      for (const std::string& pattern : urls) {
+        if (!IsValidResponseBodyPattern(pattern)) {
+          args->ThrowTypeError(
+              "A url pattern must be 1 to 2048 characters and contain at most "
+              "one *");
+          return;
+        }
+      }
+      limits.patterns = std::move(urls);
+    }
+    if (dict.Has("maxBytesPerResponse")) {
+      int value = 0;
+      if (!dict.Get("maxBytesPerResponse", &value) || value < 1 ||
+          static_cast<size_t>(value) > kResponseBodyMaxBytes) {
+        args->ThrowTypeError(
+            "maxBytesPerResponse must be an integer from 1 to 10000000");
+        return;
+      }
+      limits.max_bytes_per_response = static_cast<size_t>(value);
+    }
+    if (dict.Has("maxInFlight")) {
+      int value = 0;
+      if (!dict.Get("maxInFlight", &value) || value < 1 ||
+          value > kResponseBodyMaxInFlight) {
+        args->ThrowTypeError("maxInFlight must be an integer from 1 to 64");
+        return;
+      }
+      limits.max_in_flight = value;
+    }
+    if (dict.Has("maxAggregateBytes")) {
+      int value = 0;
+      if (!dict.Get("maxAggregateBytes", &value) || value < 1 ||
+          static_cast<size_t>(value) > kResponseBodyMaxAggregateBytes) {
+        args->ThrowTypeError(
+            "maxAggregateBytes must be an integer from 1 to 64000000");
+        return;
+      }
+      limits.max_aggregate_bytes = static_cast<size_t>(value);
+    }
+  }
+
+  ConfigureResponseBodyObservation(state, args->isolate(),
+                                  listener.As<v8::Function>(),
+                                  std::move(limits));
+}
+
+void Session::UpdateResponseBodyObservationLimits(gin::Arguments* args) {
+  if (!browser_context_ || !browser_context_->intercept_state()) {
+    args->ThrowTypeError("The session has been destroyed");
+    return;
+  }
+  InterceptState* state = browser_context_->intercept_state();
+  if (!state->response_body_enabled()) {
+    args->ThrowTypeError("Response observation is not enabled");
+    return;
+  }
+  ResponseBodyLimits limits;
+  v8::Local<v8::Value> options;
+  if (!args->GetNext(&options) || !options->IsObject()) {
+    args->ThrowTypeError("Response observation options must be an object");
+    return;
+  }
+  gin_helper::Dictionary dict(args->isolate(), options.As<v8::Object>());
+  if (dict.Has("urls")) {
+    std::vector<std::string> urls;
+    if (!dict.Get("urls", &urls) || urls.size() > 32) {
+      args->ThrowTypeError("urls must be an array of at most 32 strings");
+      return;
+    }
+    for (const std::string& pattern : urls) {
+      if (!IsValidResponseBodyPattern(pattern)) {
+        args->ThrowTypeError(
+            "A url pattern must be 1 to 2048 characters and contain at most "
+            "one *");
+        return;
+      }
+    }
+    limits.patterns = std::move(urls);
+  }
+  if (dict.Has("maxBytesPerResponse")) {
+    int value = 0;
+    if (!dict.Get("maxBytesPerResponse", &value) || value < 1 ||
+        static_cast<size_t>(value) > kResponseBodyMaxBytes) {
+      args->ThrowTypeError(
+          "maxBytesPerResponse must be an integer from 1 to 10000000");
+      return;
+    }
+    limits.max_bytes_per_response = static_cast<size_t>(value);
+  }
+  if (dict.Has("maxInFlight")) {
+    int value = 0;
+    if (!dict.Get("maxInFlight", &value) || value < 1 ||
+        value > kResponseBodyMaxInFlight) {
+      args->ThrowTypeError("maxInFlight must be an integer from 1 to 64");
+      return;
+    }
+    limits.max_in_flight = value;
+  }
+  if (dict.Has("maxAggregateBytes")) {
+    int value = 0;
+    if (!dict.Get("maxAggregateBytes", &value) || value < 1 ||
+        static_cast<size_t>(value) > kResponseBodyMaxAggregateBytes) {
+      args->ThrowTypeError(
+          "maxAggregateBytes must be an integer from 1 to 64000000");
+      return;
+    }
+    limits.max_aggregate_bytes = static_cast<size_t>(value);
+  }
+  state->UpdateResponseBodyLimits(std::move(limits));
+}
+
+void Session::SetWebSocketMessageObservation(v8::Local<v8::Value> listener,
+                                             gin::Arguments* args) {
+  if (!browser_context_ || !browser_context_->intercept_state()) {
+    args->ThrowTypeError("The session has been destroyed");
+    return;
+  }
+  InterceptState* state = browser_context_->intercept_state();
+  if (listener->IsNull() || listener->IsUndefined()) {
+    state->ClearWebSocketObservation();
+    return;
+  }
+  if (!listener->IsFunction()) {
+    args->ThrowTypeError("Must pass null or a function");
+    return;
+  }
+  WebSocketLimits limits;
+  v8::Local<v8::Value> options;
+  if (args->GetNext(&options) && !options->IsNullOrUndefined()) {
+    if (!options->IsObject()) {
+      args->ThrowTypeError("WebSocket observation options must be an object");
+      return;
+    }
+    gin_helper::Dictionary dict(args->isolate(), options.As<v8::Object>());
+    if (dict.Has("urls")) {
+      std::vector<std::string> urls;
+      if (!dict.Get("urls", &urls) || urls.size() > 32) {
+        args->ThrowTypeError("urls must be an array of at most 32 strings");
+        return;
+      }
+      for (const std::string& pattern : urls) {
+        if (!IsValidWebSocketPattern(pattern)) {
+          args->ThrowTypeError(
+              "A url pattern must be 1 to 2048 characters and contain at most "
+              "one *");
+          return;
+        }
+      }
+      limits.patterns = std::move(urls);
+    }
+    if (dict.Has("maxBytesPerMessage")) {
+      int value = 0;
+      if (!dict.Get("maxBytesPerMessage", &value) || value < 1 ||
+          static_cast<size_t>(value) > kWebSocketMaxBytes) {
+        args->ThrowTypeError(
+            "maxBytesPerMessage must be an integer from 1 to 10000000");
+        return;
+      }
+      limits.max_bytes_per_message = static_cast<size_t>(value);
+    }
+    if (dict.Has("maxInFlight")) {
+      int value = 0;
+      if (!dict.Get("maxInFlight", &value) || value < 1 ||
+          value > kWebSocketMaxInFlight) {
+        args->ThrowTypeError("maxInFlight must be an integer from 1 to 64");
+        return;
+      }
+      limits.max_in_flight = value;
+    }
+    if (dict.Has("maxAggregateBytes")) {
+      int value = 0;
+      if (!dict.Get("maxAggregateBytes", &value) || value < 1 ||
+          static_cast<size_t>(value) > kWebSocketMaxAggregateBytes) {
+        args->ThrowTypeError(
+            "maxAggregateBytes must be an integer from 1 to 64000000");
+        return;
+      }
+      limits.max_aggregate_bytes = static_cast<size_t>(value);
+    }
+  }
+  ConfigureWebSocketObservation(state, args->isolate(),
+                                listener.As<v8::Function>(), std::move(limits));
+}
+
+void Session::UpdateWebSocketMessageObservationLimits(gin::Arguments* args) {
+  if (!browser_context_ || !browser_context_->intercept_state()) {
+    args->ThrowTypeError("The session has been destroyed");
+    return;
+  }
+  InterceptState* state = browser_context_->intercept_state();
+  if (!state->websocket_enabled()) {
+    args->ThrowTypeError("WebSocket observation is not enabled");
+    return;
+  }
+  WebSocketLimits limits;
+  v8::Local<v8::Value> options;
+  if (!args->GetNext(&options) || !options->IsObject()) {
+    args->ThrowTypeError("WebSocket observation options must be an object");
+    return;
+  }
+  gin_helper::Dictionary dict(args->isolate(), options.As<v8::Object>());
+  if (dict.Has("urls")) {
+    std::vector<std::string> urls;
+    if (!dict.Get("urls", &urls) || urls.size() > 32) {
+      args->ThrowTypeError("urls must be an array of at most 32 strings");
+      return;
+    }
+    for (const std::string& pattern : urls) {
+      if (!IsValidWebSocketPattern(pattern)) {
+        args->ThrowTypeError(
+            "A url pattern must be 1 to 2048 characters and contain at most "
+            "one *");
+        return;
+      }
+    }
+    limits.patterns = std::move(urls);
+  }
+  if (dict.Has("maxBytesPerMessage")) {
+    int value = 0;
+    if (!dict.Get("maxBytesPerMessage", &value) || value < 1 ||
+        static_cast<size_t>(value) > kWebSocketMaxBytes) {
+      args->ThrowTypeError(
+          "maxBytesPerMessage must be an integer from 1 to 10000000");
+      return;
+    }
+    limits.max_bytes_per_message = static_cast<size_t>(value);
+  }
+  if (dict.Has("maxInFlight")) {
+    int value = 0;
+    if (!dict.Get("maxInFlight", &value) || value < 1 ||
+        value > kWebSocketMaxInFlight) {
+      args->ThrowTypeError("maxInFlight must be an integer from 1 to 64");
+      return;
+    }
+    limits.max_in_flight = value;
+  }
+  if (dict.Has("maxAggregateBytes")) {
+    int value = 0;
+    if (!dict.Get("maxAggregateBytes", &value) || value < 1 ||
+        static_cast<size_t>(value) > kWebSocketMaxAggregateBytes) {
+      args->ThrowTypeError(
+          "maxAggregateBytes must be an integer from 1 to 64000000");
+      return;
+    }
+    limits.max_aggregate_bytes = static_cast<size_t>(value);
+  }
+  UpdateWebSocketObservationLimits(state, std::move(limits));
+}
+
 void Session::SetPermissionCheckHandler(v8::Local<v8::Value> val,
                                         gin::Arguments* args) {
   ElectronPermissionManager::CheckHandler handler;
@@ -1065,6 +1351,178 @@ void Session::AllowNTLMCredentialsForDomains(const std::string& domains) {
       !command_line->HasSwitch(electron::switches::kDisableNTLMv2);
   content::GetNetworkService()->ConfigureHttpAuthPrefs(
       std::move(auth_dynamic_params));
+}
+
+bool ReadBrandList(v8::Isolate* isolate,
+                   v8::Local<v8::Value> value,
+                   std::vector<std::pair<std::string, std::string>>* out,
+                   std::string* error) {
+  if (!value->IsArray()) {
+    *error = "brand list must be an array";
+    return false;
+  }
+  auto array = value.As<v8::Array>();
+  if (array->Length() < 1 || array->Length() > 8) {
+    *error = "brand list must contain 1 to 8 entries";
+    return false;
+  }
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  for (uint32_t i = 0; i < array->Length(); ++i) {
+    v8::Local<v8::Value> entry;
+    if (!array->Get(context, i).ToLocal(&entry) || !entry->IsObject()) {
+      *error = "brand entries must be objects";
+      return false;
+    }
+    gin_helper::Dictionary dict(isolate, entry.As<v8::Object>());
+    std::string brand;
+    std::string version;
+    if (!dict.Get("brand", &brand) || !dict.Get("version", &version) ||
+        brand.empty() || version.empty()) {
+      *error = "brand entries need brand and version";
+      return false;
+    }
+    out->emplace_back(std::move(brand), std::move(version));
+  }
+  return true;
+}
+
+std::string DeviceMemorySwitch(double value) {
+  if (value == 0.25)
+    return "0.25";
+  if (value == 0.5)
+    return "0.5";
+  if (value == 1)
+    return "1";
+  if (value == 2)
+    return "2";
+  if (value == 4)
+    return "4";
+  if (value == 8)
+    return "8";
+  if (value == 16)
+    return "16";
+  if (value == 32)
+    return "32";
+  if (value == 64)
+    return "64";
+  return std::string();
+}
+
+void Session::SetAgentPersona(gin::Arguments* args) {
+  v8::Isolate* isolate = args->isolate();
+  gin_helper::Dictionary options;
+  if (!args->GetNext(&options)) {
+    args->ThrowTypeError("persona options are required");
+    return;
+  }
+  ElectronBrowserContext::AgentPersona persona;
+  if (!options.Get("id", &persona.id) || persona.id.empty() ||
+      !options.Get("seed", &persona.seed) || persona.seed.empty() ||
+      !options.Get("userAgent", &persona.user_agent) ||
+      persona.user_agent.empty() ||
+      !options.Get("acceptLanguages", &persona.accept_languages) ||
+      persona.accept_languages.empty() ||
+      !options.Get("timezone", &persona.timezone) || persona.timezone.empty() ||
+      !options.Get("hardwareConcurrency", &persona.hardware_concurrency) ||
+      !options.Get("fullVersion", &persona.full_version) ||
+      !options.Get("platform", &persona.platform) ||
+      !options.Get("platformVersion", &persona.platform_version) ||
+      !options.Get("architecture", &persona.architecture) ||
+      !options.Get("bitness", &persona.bitness) ||
+      !options.Get("model", &persona.model) ||
+      !options.Get("mobile", &persona.mobile) ||
+      !options.Get("wow64", &persona.wow64) ||
+      !options.Get("formFactors", &persona.form_factors) ||
+      persona.form_factors.empty()) {
+    args->ThrowTypeError("persona is missing a required field");
+    return;
+  }
+  double device_memory = 0;
+  if (!options.Get("deviceMemory", &device_memory)) {
+    args->ThrowTypeError("deviceMemory must be a number");
+    return;
+  }
+  persona.device_memory = DeviceMemorySwitch(device_memory);
+  if (persona.device_memory.empty() || persona.hardware_concurrency < 1 ||
+      persona.hardware_concurrency > 1024) {
+    args->ThrowTypeError("hardwareConcurrency or deviceMemory is out of range");
+    return;
+  }
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  v8::Local<v8::Object> handle = options.GetHandle();
+  v8::Local<v8::Value> brands;
+  v8::Local<v8::Value> full_versions;
+  std::string error;
+  if (!handle->Get(context, gin::StringToV8(isolate, "brands")).ToLocal(&brands) ||
+      !ReadBrandList(isolate, brands, &persona.brands, &error) ||
+      !handle->Get(context, gin::StringToV8(isolate, "fullVersionList"))
+           .ToLocal(&full_versions) ||
+      !ReadBrandList(isolate, full_versions, &persona.full_version_list,
+                     &error)) {
+    args->ThrowTypeError(error.empty() ? "brand list is invalid" : error);
+    return;
+  }
+  gin_helper::Dictionary screen;
+  if (options.Get("screen", &screen)) {
+    if (!screen.Get("width", &persona.screen_width) ||
+        !screen.Get("height", &persona.screen_height) ||
+        !screen.Get("availWidth", &persona.screen_avail_width) ||
+        !screen.Get("availHeight", &persona.screen_avail_height) ||
+        !screen.Get("colorDepth", &persona.screen_color_depth) ||
+        !screen.Get("deviceScaleFactor", &persona.screen_device_scale_factor) ||
+        persona.screen_width < 1 || persona.screen_height < 1 ||
+        persona.screen_avail_width < 1 || persona.screen_avail_height < 1 ||
+        persona.screen_device_scale_factor <= 0) {
+      args->ThrowTypeError("screen metrics are invalid");
+      return;
+    }
+    if (screen.Get("colorIndex", &persona.screen_color_index)) {
+      if (persona.screen_color_index < 0 || persona.screen_color_index > 65535) {
+        args->ThrowTypeError("screen.colorIndex is invalid");
+        return;
+      }
+      persona.has_screen_color_index = true;
+    }
+    if (screen.Get("highDynamicRange", &persona.screen_hdr))
+      persona.has_screen_hdr = true;
+  }
+  gin_helper::Dictionary webgl;
+  if (options.Get("webgl", &webgl)) {
+    if (!webgl.Get("vendor", &persona.webgl_vendor) ||
+        persona.webgl_vendor.empty() ||
+        !webgl.Get("renderer", &persona.webgl_renderer) ||
+        persona.webgl_renderer.empty()) {
+      args->ThrowTypeError("webgl vendor and renderer are required");
+      return;
+    }
+  }
+  gin_helper::Dictionary webgpu;
+  if (options.Get("webgpu", &webgpu)) {
+    if (!webgpu.Get("vendor", &persona.webgpu_vendor) ||
+        persona.webgpu_vendor.empty() ||
+        !webgpu.Get("architecture", &persona.webgpu_architecture) ||
+        persona.webgpu_architecture.empty() ||
+        !webgpu.Get("device", &persona.webgpu_device) ||
+        persona.webgpu_device.empty() ||
+        !webgpu.Get("description", &persona.webgpu_description) ||
+        persona.webgpu_description.empty()) {
+      args->ThrowTypeError("webgpu adapter identifiers are required");
+      return;
+    }
+  }
+  options.Get("webrtcIpHandlingPolicy", &persona.webrtc_ip_handling_policy);
+  std::string font_policy;
+  if (options.Get("fontPolicy", &font_policy)) {
+    if (font_policy == "core") {
+      persona.font_policy_core = true;
+    } else if (font_policy != "real") {
+      args->ThrowTypeError("fontPolicy must be real or core");
+      return;
+    }
+  }
+  error = browser_context_->ApplyAgentPersona(std::move(persona));
+  if (!error.empty())
+    args->ThrowTypeError(error);
 }
 
 void Session::SetUserAgent(const std::string& user_agent,
@@ -1886,6 +2344,14 @@ void Session::FillObjectTemplate(v8::Isolate* isolate,
           "setPermissionRequestHandler")
       .SetMethod<&Session::SetPermissionCheckHandler>(
           "setPermissionCheckHandler")
+      .SetMethod<&Session::SetResponseBodyObservation>(
+          "setResponseBodyObservation")
+      .SetMethod<&Session::UpdateResponseBodyObservationLimits>(
+          "updateResponseBodyObservationLimits")
+      .SetMethod<&Session::SetWebSocketMessageObservation>(
+          "setWebSocketMessageObservation")
+      .SetMethod<&Session::UpdateWebSocketMessageObservationLimits>(
+          "updateWebSocketMessageObservationLimits")
       .SetMethod<&Session::SetDisplayMediaRequestHandler>(
           "setDisplayMediaRequestHandler")
       .SetMethod<&Session::SetDevicePermissionHandler>(
@@ -1900,6 +2366,7 @@ void Session::FillObjectTemplate(v8::Isolate* isolate,
           "allowNTLMCredentialsForDomains")
       .SetMethod<&Session::IsPersistent>("isPersistent")
       .SetMethod<&Session::SetUserAgent>("setUserAgent")
+      .SetMethod<&Session::SetAgentPersona>("setAgentPersona")
       .SetMethod<&Session::GetUserAgent>("getUserAgent")
       .SetMethod<&Session::SetSSLConfig>("setSSLConfig")
       .SetMethod<&Session::GetBlobData>("getBlobData")

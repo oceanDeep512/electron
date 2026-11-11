@@ -12,6 +12,7 @@
   },
   "files": [
     "electron/main.ts",
+    "electron/agent-runtime.ts",
     "electron/renderer.ts",
     "electron/utility.ts",
     "../../electron.d.ts"

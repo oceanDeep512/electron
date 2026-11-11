@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Electron Agent Runtime <agent-runtime@electron.local>
+Date: Wed, 11 Nov 2026 19:10:00 +0000
+Subject: [electron] perturb canvas readback without changing the displayed bitmap
+
+An agent persona passes these values on the renderer command line. The
+switches are absent unless that renderer belongs to a persona session, so
+other processes keep Chromium's behavior. Nothing here is compiled in this
+change.
+
+diff --git a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
+--- a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
++++ b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
+@@ -32,6 +32,10 @@
+ 
+ #include "third_party/blink/renderer/platform/graphics/image_data_buffer.h"
+ 
++#include <cstring>
++#include <vector>
++
++#include "base/command_line.h"
+ #include "base/compiler_specific.h"
+ #include "base/logging.h"
+ #include "base/memory/ptr_util.h"
+@@ -46,6 +50,45 @@
+ 
+ namespace blink {
+ 
++
++void PerturbCanvasBytes(uint8_t* data, size_t size) {
++  const std::string seed =
++      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++          "electron-agent-canvas-seed");
++  if (seed.empty() || !data || size == 0)
++    return;
++  uint32_t hash = 2166136261u;
++  for (unsigned char c : seed)
++    hash = (hash ^ c) * 16777619u;
++  for (size_t i = 0; i < size; i += 64) {
++    uint32_t mixed = (hash ^ static_cast<uint32_t>(i) ^ data[i]) * 0x9E3779B1u;
++    if (mixed & 1u) {
++      data[i] = data[i] == 255 ? static_cast<uint8_t>(254)
++                               : static_cast<uint8_t>(data[i] + 1);
++    } else {
++      data[i] = data[i] == 0 ? static_cast<uint8_t>(1)
++                             : static_cast<uint8_t>(data[i] - 1);
++    }
++  }
++}
++
++
++SkPixmap PersonaReadbackPixmap(const SkPixmap& pixmap,
++                               std::vector<uint8_t>* storage) {
++  const std::string seed =
++      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++          "electron-agent-canvas-seed");
++  if (seed.empty() || !pixmap.addr())
++    return pixmap;
++  const size_t size = pixmap.computeByteSize();
++  if (size == 0)
++    return pixmap;
++  storage->resize(size);
++  memcpy(storage->data(), pixmap.addr(), size);
++  PerturbCanvasBytes(storage->data(), storage->size());
++  return SkPixmap(pixmap.info(), storage->data(), pixmap.rowBytes());
++}
++
+ ImageDataBuffer::ImageDataBuffer(scoped_refptr<StaticBitmapImage> image) {
+   if (!image)
+     return;
+@@ -147,7 +190,9 @@
+                                   Vector<unsigned char>* encoded_image) const {
+   std::optional<skhdr::Metadata> hdr_metadata =
+       ImageEncoderUtils::ToSkHdrMetadata(hdr_metadata_);
+-  return ImageEncoder::Encode(encoded_image, pixmap_,
++  std::vector<uint8_t> storage;
++  const SkPixmap encoded = PersonaReadbackPixmap(pixmap_, &storage);
++  return ImageEncoder::Encode(encoded_image, encoded,
+                               base::OptionalToPtr(hdr_metadata), mime_type,
+                               quality);
+ }
+@@ -158,7 +203,9 @@
+   Vector<unsigned char> result;
+   std::optional<skhdr::Metadata> hdr_metadata =
+       ImageEncoderUtils::ToSkHdrMetadata(hdr_metadata_);
+-  if (!ImageEncoder::Encode(&result, pixmap_, base::OptionalToPtr(hdr_metadata),
++  std::vector<uint8_t> storage;
++  const SkPixmap encoded = PersonaReadbackPixmap(pixmap_, &storage);
++  if (!ImageEncoder::Encode(&result, encoded, base::OptionalToPtr(hdr_metadata),
+                             mime_type, quality)) {
+     return "data:,";
+   }
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+@@ -6,6 +6,8 @@
+ 
+ #include <inttypes.h>
+ 
++#include "base/command_line.h"
++
+ #include <cmath>
+ #include <cstdint>
+ #include <cstdlib>
+@@ -154,6 +156,38 @@
+ namespace {
+ 
+ 
++void PerturbCanvasBytes(uint8_t* data, size_t size) {
++  const std::string seed =
++      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++          "electron-agent-canvas-seed");
++  if (seed.empty() || !data || size == 0)
++    return;
++  uint32_t hash = 2166136261u;
++  for (unsigned char c : seed)
++    hash = (hash ^ c) * 16777619u;
++  for (size_t i = 0; i < size; i += 64) {
++    uint32_t mixed = (hash ^ static_cast<uint32_t>(i) ^ data[i]) * 0x9E3779B1u;
++    if (mixed & 1u) {
++      data[i] = data[i] == 255 ? static_cast<uint8_t>(254)
++                               : static_cast<uint8_t>(data[i] + 1);
++    } else {
++      data[i] = data[i] == 0 ? static_cast<uint8_t>(1)
++                             : static_cast<uint8_t>(data[i] - 1);
++    }
++  }
++}
++
++
++void PerturbReadbackImageData(ImageData* image_data) {
++  if (!image_data)
++    return;
++  SkPixmap pixmap = image_data->GetSkPixmap();
++  if (!pixmap.addr())
++    return;
++  PerturbCanvasBytes(static_cast<uint8_t*>(pixmap.writable_addr()),
++                     pixmap.computeByteSize());
++}
++
+ bool IsContextProviderValid() {
+   base::WeakPtr<WebGraphicsContext3DProviderWrapper> context_provider_wrapper =
+       SharedGpuContext::ContextProviderWrapper();
+@@ -1203,9 +1237,11 @@
+       GetDefaultImageDataColorSpace();
+ 
+   if (isContextLost()) {
+-    return ImageData::ValidateAndCreate(
++    ImageData* lost = ImageData::ValidateAndCreate(
+         sw, sh, std::nullopt, image_data_settings, validate_and_create_params,
+         exception_state);
++    PerturbReadbackImageData(lost);
++    return lost;
+   }
+ 
+   // Deferred offscreen canvases might have recorded commands, make sure
+@@ -1288,6 +1324,7 @@
+       // If the readback area is completely out of bounds just return a zero
+       // initialized buffer. No point in trying to perform out of bounds read.
+       CHECK(validate_and_create_params.zero_initialize);
++      PerturbReadbackImageData(image_data);
+       return image_data;
+     }
+ 
+@@ -1303,6 +1340,7 @@
+     }
+   }
+ 
++  PerturbReadbackImageData(image_data);
+   return image_data;
+ }
+ 

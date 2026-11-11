@@ -45,6 +45,8 @@ class PendingRemote;
 
 namespace electron {
 
+class ResponseBodyFollow;
+
 const uint32_t kBypassCustomProtocolHandlers = 1 << 30;
 
 // This class is responsible for following tasks when NetworkService is enabled:
@@ -161,6 +163,7 @@ class ProxyingURLLoaderFactory
 
     network::mojom::URLResponseHeadPtr current_response_;
     mojo::ScopedDataPipeConsumerHandle current_body_;
+    std::unique_ptr<ResponseBodyFollow> response_body_;
     scoped_refptr<net::HttpResponseHeaders> override_headers_;
     GURL redirect_url_;
     int redirect_count_ = 0;

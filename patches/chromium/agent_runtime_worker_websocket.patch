@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Electron Agent Runtime <agent-runtime@electron.local>
+Date: Wed, 11 Nov 2026 19:40:00 +0000
+Subject: [electron] observe shared-worker and service-worker WebSockets
+
+The frame-only WebSocket hook cannot see a connector whose frame routing id
+is kRoutingIdNone. A worker hook receives the renderer process so the embedder
+can attribute the socket to that BrowserContext. The default returns false.
+Nothing here is compiled in this change.
+
+diff --git a/content/browser/websockets/websocket_connector_impl.cc b/content/browser/websockets/websocket_connector_impl.cc
+--- a/content/browser/websockets/websocket_connector_impl.cc
++++ b/content/browser/websockets/websocket_connector_impl.cc
+@@ -143,10 +143,25 @@
+       options.options, std::move(throttling_profile_id),
+       network_restrictions_id_, target_address_space, target_network);
+ 
+-  if (GetContentClient()->browser()->WillInterceptWebSocket(frame)) {
+-    GetContentClient()->browser()->CreateWebSocket(
+-        frame, std::move(factory), url, isolation_info_.site_for_cookies(),
+-        user_agent, std::move(handshake_client), std::move(options));
++  // Shared and service workers have no frame. Their renderer process still
++  // identifies the BrowserContext. Dedicated workers keep the frame path.
++  content::ContentBrowserClient* browser_client = GetContentClient()->browser();
++  const bool worker_socket =
++      frame_id_.frame_routing_id == IPC::mojom::kRoutingIdNone;
++  const bool intercept =
++      worker_socket ? browser_client->WillInterceptWorkerWebSocket(process)
++                    : browser_client->WillInterceptWebSocket(frame);
++  if (intercept) {
++    if (worker_socket) {
++      browser_client->CreateWorkerWebSocket(
++          process, origin_, std::move(factory), url,
++          isolation_info_.site_for_cookies(), user_agent,
++          std::move(handshake_client), std::move(options));
++    } else {
++      browser_client->CreateWebSocket(
++          frame, std::move(factory), url, isolation_info_.site_for_cookies(),
++          user_agent, std::move(handshake_client), std::move(options));
++    }
+     return;
+   }
+ 
+diff --git a/content/public/browser/content_browser_client.h b/content/public/browser/content_browser_client.h
+--- a/content/public/browser/content_browser_client.h
++++ b/content/public/browser/content_browser_client.h
+@@ -2091,6 +2091,24 @@
+           handshake_client,
+       WebSocketOptions options);
+ 
++  // Electron: shared workers and service workers call Connect with
++  // frame_routing_id kRoutingIdNone, so |frame| is null. |process| is that
++  // worker's renderer. The default returns false and does not change frame
++  // interception.
++  virtual bool WillInterceptWorkerWebSocket(RenderProcessHost* process);
++
++  // Called only when WillInterceptWorkerWebSocket returns true.
++  virtual void CreateWorkerWebSocket(
++      RenderProcessHost* process,
++      const url::Origin& origin,
++      WebSocketFactory factory,
++      const GURL& url,
++      const net::SiteForCookies& site_for_cookies,
++      const std::optional<std::string>& user_agent,
++      mojo::PendingRemote<network::mojom::WebSocketHandshakeClient>
++          handshake_client,
++      WebSocketOptions options);
++
+   // Allows the embedder to control if establishing a WebTransport connection is
+   // allowed.
+   //
+diff --git a/content/public/browser/content_browser_client.cc b/content/public/browser/content_browser_client.cc
+--- a/content/public/browser/content_browser_client.cc
++++ b/content/public/browser/content_browser_client.cc
+@@ -1170,6 +1170,24 @@
+   NOTREACHED();
+ }
+ 
++bool ContentBrowserClient::WillInterceptWorkerWebSocket(RenderProcessHost*) {
++  return false;
++}
++
++void ContentBrowserClient::CreateWorkerWebSocket(
++    RenderProcessHost* process,
++    const url::Origin& origin,
++    WebSocketFactory factory,
++    const GURL& url,
++    const net::SiteForCookies& site_for_cookies,
++    const std::optional<std::string>& user_agent,
++    mojo::PendingRemote<network::mojom::WebSocketHandshakeClient>
++        handshake_client,
++    ContentBrowserClient::WebSocketOptions options) {
++  // NOTREACHED because WillInterceptWorkerWebSocket returns false.
++  NOTREACHED();
++}
++
+ void ContentBrowserClient::WillCreateWebTransport(
+     int process_id,
+     int frame_routing_id,

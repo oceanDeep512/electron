@@ -29,6 +29,7 @@
 #include "shell/common/node_includes.h"
 #include "shell/common/node_util.h"
 #include "shell/common/options_switches.h"
+#include "third_party/blink/renderer/core/timezone/timezone_controller.h"
 #include "shell/common/plugin.mojom.h"
 #include "shell/common/world_ids.h"
 #include "shell/renderer/api/context_bridge/object_cache.h"
@@ -256,6 +257,19 @@ bool RendererClientBase::ShouldLoadPreload(
 
 void RendererClientBase::RenderThreadStarted() {
   auto* command_line = base::CommandLine::ForCurrentProcess();
+
+  // Session persona timezone. The switch is present only on this session's
+  // renderer processes. The returned handle must stay alive; its destructor
+  // clears the override. The browser process never reaches this function.
+  const std::string timezone =
+      command_line->GetSwitchValueASCII(switches::kAgentTimezone);
+  if (!timezone.empty()) {
+    static std::unique_ptr<blink::TimeZoneController::TimeZoneOverride> kept;
+    auto result = blink::TimeZoneController::SetTimeZoneOverride(
+        WTF::String::FromUtf8(timezone));
+    if (result.handle)
+      kept = std::move(result.handle);
+  }
 
   // Enable MessagePort close event by default.
   // The feature got reverted from stable to test in

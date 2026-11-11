@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Electron Agent Runtime <agent-runtime@electron.local>
+Date: Wed, 11 Nov 2026 19:40:00 +0000
+Subject: [electron] override WebGL and WebGPU adapter identifiers
+
+An agent persona passes these values on the renderer command line. The
+switches are absent unless that renderer belongs to a persona session, so
+other processes keep Chromium's behavior. WebGPU strings are initialized once.
+Nothing here is compiled in this change.
+
+diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+--- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
++++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+@@ -27,6 +27,8 @@
+ 
+ #include <inttypes.h>
+ 
++#include "base/command_line.h"
++
+ #include <memory>
+ #include <utility>
+ 
+@@ -207,6 +209,15 @@
+ 
+ namespace {
+ 
++String AgentWebGLString(const char* switch_name, const String& fallback) {
++  const std::string value =
++      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(switch_name);
++  if (value.empty())
++    return fallback;
++  String override_value = String::FromUtf8(value);
++  return override_value.IsNull() ? fallback : override_value;
++}
++
+ enum class WebGLANGLEImplementation {
+   // These values are persisted to logs. Entries should not be renumbered and
+   // numeric values should never be reused.
+@@ -4197,7 +4208,9 @@
+     case GL_RENDERBUFFER_BINDING:
+       return WebGLAny(script_state, renderbuffer_binding_.Get());
+     case GL_RENDERER:
+-      return WebGLAny(script_state, String("WebKit WebGL"));
++      return WebGLAny(script_state,
++                      AgentWebGLString("electron-agent-webgl-renderer",
++                                       String("WebKit WebGL")));
+     case GL_SAMPLE_ALPHA_TO_COVERAGE:
+       return GetBooleanParameter(script_state, pname);
+     case GL_SAMPLE_BUFFERS:
+@@ -4275,7 +4288,8 @@
+     case GC3D_UNPACK_COLORSPACE_CONVERSION_WEBGL:
+       return WebGLAny(script_state, unpack_colorspace_conversion_);
+     case GL_VENDOR:
+-      return WebGLAny(script_state, String("WebKit"));
++      return WebGLAny(script_state, AgentWebGLString("electron-agent-webgl-vendor",
++                                                     String("WebKit")));
+     case GL_VERSION:
+       return WebGLAny(
+           script_state,
+@@ -4293,8 +4307,10 @@
+       return ScriptValue::CreateNull(script_state->GetIsolate());
+     case WebGLDebugRendererInfo::kUnmaskedRendererWebgl:
+       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
+-        return WebGLAny(script_state,
+-                        String(ContextGL()->GetString(GL_RENDERER)));
++        return WebGLAny(
++            script_state,
++            AgentWebGLString("electron-agent-webgl-renderer",
++                             String(ContextGL()->GetString(GL_RENDERER))));
+       }
+       SynthesizeGLError(
+           GL_INVALID_ENUM, "getParameter",
+@@ -4302,8 +4318,10 @@
+       return ScriptValue::CreateNull(script_state->GetIsolate());
+     case WebGLDebugRendererInfo::kUnmaskedVendorWebgl:
+       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
+-        return WebGLAny(script_state,
+-                        String(ContextGL()->GetString(GL_VENDOR)));
++        return WebGLAny(
++            script_state,
++            AgentWebGLString("electron-agent-webgl-vendor",
++                             String(ContextGL()->GetString(GL_VENDOR))));
+       }
+       SynthesizeGLError(
+           GL_INVALID_ENUM, "getParameter",
+diff --git a/third_party/blink/renderer/modules/webgpu/gpu_adapter_info.cc b/third_party/blink/renderer/modules/webgpu/gpu_adapter_info.cc
+--- a/third_party/blink/renderer/modules/webgpu/gpu_adapter_info.cc
++++ b/third_party/blink/renderer/modules/webgpu/gpu_adapter_info.cc
+@@ -4,11 +4,49 @@
+ 
+ #include "third_party/blink/renderer/modules/webgpu/gpu_adapter_info.h"
+ 
++#include "base/command_line.h"
++#include "base/no_destructor.h"
+ #include "third_party/blink/renderer/modules/webgpu/gpu_memory_heap_info.h"
+ #include "third_party/blink/renderer/modules/webgpu/gpu_subgroup_matrix_config.h"
+ 
+ namespace blink {
+ 
++struct AgentWebGPUStrings {
++  String vendor;
++  String architecture;
++  String device;
++  String description;
++};
++
++AgentWebGPUStrings ReadAgentWebGPUStrings() {
++  AgentWebGPUStrings values;
++  const base::CommandLine* command_line =
++      base::CommandLine::ForCurrentProcess();
++  values.vendor = String::FromUtf8(
++      command_line->GetSwitchValueASCII("electron-agent-webgpu-vendor"));
++  values.architecture = String::FromUtf8(command_line->GetSwitchValueASCII(
++      "electron-agent-webgpu-architecture"));
++  values.device = String::FromUtf8(
++      command_line->GetSwitchValueASCII("electron-agent-webgpu-device"));
++  values.description = String::FromUtf8(
++      command_line->GetSwitchValueASCII("electron-agent-webgpu-description"));
++  return values;
++}
++
++const String& AgentWebGPUOverride(const char* switch_name) {
++  // Function-local static initialization runs once, including across threads.
++  // NoDestructor keeps the strings for the process lifetime.
++  static base::NoDestructor<AgentWebGPUStrings> values(ReadAgentWebGPUStrings());
++  const std::string name(switch_name);
++  if (name == "electron-agent-webgpu-vendor")
++    return values->vendor;
++  if (name == "electron-agent-webgpu-architecture")
++    return values->architecture;
++  if (name == "electron-agent-webgpu-device")
++    return values->device;
++  return values->description;
++}
++
+ GPUAdapterInfo::GPUAdapterInfo(const String& vendor,
+                                const String& architecture,
+                                uint32_t subgroup_min_size,
+@@ -46,19 +84,27 @@
+ }
+ 
+ const String& GPUAdapterInfo::vendor() const {
+-  return vendor_;
++  const String& override_value =
++      AgentWebGPUOverride("electron-agent-webgpu-vendor");
++  return override_value.empty() ? vendor_ : override_value;
+ }
+ 
+ const String& GPUAdapterInfo::architecture() const {
+-  return architecture_;
++  const String& override_value =
++      AgentWebGPUOverride("electron-agent-webgpu-architecture");
++  return override_value.empty() ? architecture_ : override_value;
+ }
+ 
+ const String& GPUAdapterInfo::device() const {
+-  return device_;
++  const String& override_value =
++      AgentWebGPUOverride("electron-agent-webgpu-device");
++  return override_value.empty() ? device_ : override_value;
+ }
+ 
+ const String& GPUAdapterInfo::description() const {
+-  return description_;
++  const String& override_value =
++      AgentWebGPUOverride("electron-agent-webgpu-description");
++  return override_value.empty() ? description_ : override_value;
+ }
+ 
+ uint32_t GPUAdapterInfo::subgroupMinSize() const {

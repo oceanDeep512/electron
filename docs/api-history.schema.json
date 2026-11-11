@@ -7,9 +7,12 @@
       "type": "object",
       "properties": {
         "pr-url": {
-          "description": "URL to the 'main' GitHub Pull Request for the change (i.e. not a backport PR)",
-          "type": "string", "pattern": "^https://github.com/electron/electron/pull/\\d+$",
-          "examples": [ "https://github.com/electron/electron/pull/26789" ]
+          "description": "URL to the main GitHub pull request for the change, not a backport. electron/electron remains valid. This fork also accepts oceanDeep512/electron so a fork-only API can cite its real pull request. Do not invent an electron/electron number.",
+          "type": "string", "pattern": "^https://github.com/(electron|oceanDeep512)/electron/pull/\\d+$",
+          "examples": [
+            "https://github.com/electron/electron/pull/26789",
+            "https://github.com/oceanDeep512/electron/pull/1"
+          ]
         },
         "breaking-changes-header": {
           "description": "Heading ID for the change in `electron/docs/breaking-changes.md`",

@@ -2,6 +2,7 @@
 
 // Browser side modules, please sort alphabetically.
 export const browserModuleList: ElectronInternal.ModuleEntry[] = [
+  { name: 'agentRuntime', loader: () => require('./agent-runtime') },
   { name: 'app', loader: () => require('./app') },
   { name: 'autoUpdater', loader: () => require('./auto-updater') },
   { name: 'BaseWindow', loader: () => require('./base-window') },

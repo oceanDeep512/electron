@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Electron Agent Runtime <agent-runtime@electron.local>
+Date: Wed, 11 Nov 2026 19:40:00 +0000
+Subject: [electron] match persona scale and color depth in media queries
+
+Resolution and color media features follow the persona screen switch.
+LocalFrame::DevicePixelRatio() is unchanged, so layout and painting keep the
+real scale. This patch calls ReadAgentScreenOverride from
+agent_persona_screen_metrics.patch and is applied after that patch.
+Nothing here is compiled in this change.
+
+diff --git a/third_party/blink/renderer/core/css/media_values.cc b/third_party/blink/renderer/core/css/media_values.cc
+--- a/third_party/blink/renderer/core/css/media_values.cc
++++ b/third_party/blink/renderer/core/css/media_values.cc
+@@ -193,6 +193,9 @@
+ }
+ 
+ float MediaValues::CalculateDevicePixelRatio(LocalFrame* frame) {
++  // Media queries only. LocalFrame::DevicePixelRatio() stays the layout scale.
++  if (std::optional<AgentScreenOverride> agent = ReadAgentScreenOverride())
++    return agent->scale;
+   return frame->DevicePixelRatio();
+ }
+ 
+@@ -205,9 +208,30 @@
+       .display_color_spaces.SupportsHDR();
+ }
+ 
++static int AgentColorBitsPerComponent(int depth) {
++  // CSS `color` is bits per component. screen.colorDepth is the total depth.
++  // 32-bit screens still have 8 bits per channel. 24, 30, and 48 divide by 3.
++  switch (depth) {
++    case 48:
++      return 16;
++    case 32:
++    case 24:
++    case 8:
++      return 8;
++    case 30:
++      return 10;
++    case 16:
++      return 5;
++    default:
++      return depth > 0 ? depth : 0;
++  }
++}
++
+ int MediaValues::CalculateColorBitsPerComponent(LocalFrame* frame) {
+   DCHECK(frame);
+   DCHECK(frame->GetPage());
++  if (std::optional<AgentScreenOverride> agent = ReadAgentScreenOverride())
++    return AgentColorBitsPerComponent(agent->depth);
+   const display::ScreenInfo& screen_info =
+       frame->GetPage()->GetChromeClient().GetScreenInfo(*frame);
+   if (screen_info.is_monochrome) {

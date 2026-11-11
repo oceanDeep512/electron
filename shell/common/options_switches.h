@@ -331,6 +331,36 @@ inline constexpr base::cstring_view kEnableAuthNegotiatePort =
 // If set, NTLM v2 is disabled for POSIX platforms.
 inline constexpr base::cstring_view kDisableNTLMv2 = "disable-ntlm-v2";
 
+// Agent persona values for one session's renderer processes. The browser
+// process does not apply these switches to itself.
+inline constexpr base::cstring_view kAgentHardwareConcurrency =
+    "electron-agent-hardware-concurrency";
+inline constexpr base::cstring_view kAgentDeviceMemory =
+    "electron-agent-device-memory";
+inline constexpr base::cstring_view kAgentTimezone = "electron-agent-timezone";
+inline constexpr base::cstring_view kAgentScreen = "electron-agent-screen";
+inline constexpr base::cstring_view kAgentWebGLVendor =
+    "electron-agent-webgl-vendor";
+inline constexpr base::cstring_view kAgentWebGLRenderer =
+    "electron-agent-webgl-renderer";
+inline constexpr base::cstring_view kAgentWebGPUVendor =
+    "electron-agent-webgpu-vendor";
+inline constexpr base::cstring_view kAgentWebGPUArchitecture =
+    "electron-agent-webgpu-architecture";
+inline constexpr base::cstring_view kAgentWebGPUDevice =
+    "electron-agent-webgpu-device";
+inline constexpr base::cstring_view kAgentWebGPUDescription =
+    "electron-agent-webgpu-description";
+inline constexpr base::cstring_view kAgentCanvasSeed =
+    "electron-agent-canvas-seed";
+inline constexpr base::cstring_view kAgentAudioSeed =
+    "electron-agent-audio-seed";
+inline constexpr base::cstring_view kAgentFontPolicy =
+    "electron-agent-font-policy";
+inline constexpr base::cstring_view kAgentColorIndex =
+    "electron-agent-color-index";
+inline constexpr base::cstring_view kAgentHdr = "electron-agent-hdr";
+
 }  // namespace switches
 
 }  // namespace electron

@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Electron Agent Runtime <agent-runtime@electron.local>
+Date: Wed, 11 Nov 2026 18:40:00 +0000
+Subject: [electron] per-context user agent for shared and service workers
+
+Shared workers and service workers take the process-wide user agent.
+Dedicated workers already copy the document override. This adds a
+ContentBrowserClient hook so an embedder can replace that pair for the
+worker's BrowserContext. The default leaves the values unchanged.
+
+diff --git a/content/browser/service_worker/service_worker_version.cc b/content/browser/service_worker/service_worker_version.cc
+--- a/content/browser/service_worker/service_worker_version.cc
++++ b/content/browser/service_worker/service_worker_version.cc
+@@ -2824,6 +2824,13 @@
+   ContentBrowserClient* browser_client = GetContentClient()->browser();
+   params->user_agent = browser_client->GetUserAgent();
+   params->ua_metadata = browser_client->GetUserAgentMetadata();
++  // Electron agent persona. Dedicated workers copy the document override and
++  // do not reach this path. The default method leaves these values unchanged.
++  if (context_->wrapper()) {
++    browser_client->OverrideUserAgentForBrowserContext(
++        context_->wrapper()->browser_context(), &params->user_agent,
++        &params->ua_metadata);
++  }
+   params->is_installed = IsInstalled(status_);
+   params->script_url_to_skip_throttling = updated_script_url_;
+   params->main_script_load_params = std::move(main_script_load_params_);
+diff --git a/content/browser/worker_host/shared_worker_host.cc b/content/browser/worker_host/shared_worker_host.cc
+--- a/content/browser/worker_host/shared_worker_host.cc
++++ b/content/browser/worker_host/shared_worker_host.cc
+@@ -477,14 +477,22 @@
+                                    .GetWebExposedIsolationInfo()
+                                    .is_isolated();
+ 
++  std::string worker_user_agent =
++      GetContentClient()->browser()->GetUserAgent();
++  blink::UserAgentMetadata worker_ua_metadata =
++      GetContentClient()->browser()->GetUserAgentMetadata();
++  // Electron agent persona. The default method leaves these values unchanged.
++  GetContentClient()->browser()->OverrideUserAgentForBrowserContext(
++      GetProcessHost()->GetBrowserContext(), &worker_user_agent,
++      &worker_ua_metadata);
++
+   // Send the CreateSharedWorker message.
+   factory_.Bind(std::move(factory));
+   factory_->CreateSharedWorker(
+       std::move(info), token_, instance_.creator_storage_key(),
+       instance_.worker_storage_key().origin(),
+       creator_policy_container_host_->policies().is_web_secure_context,
+-      GetContentClient()->browser()->GetUserAgent(),
+-      GetContentClient()->browser()->GetUserAgentMetadata(),
++      worker_user_agent, worker_ua_metadata,
+       devtools_handle_->pause_on_start(), devtools_handle_->dev_tools_token(),
+       std::move(renderer_preferences), std::move(preference_watcher_receiver),
+       std::move(content_settings), std::move(container_info),
+diff --git a/content/public/browser/content_browser_client.h b/content/public/browser/content_browser_client.h
+--- a/content/public/browser/content_browser_client.h
++++ b/content/public/browser/content_browser_client.h
+@@ -2587,6 +2587,14 @@
+   // Returns user agent metadata. Content may cache this value.
+   virtual blink::UserAgentMetadata GetUserAgentMetadata();
+ 
++  // Electron agent persona. Shared workers and service workers start from
++  // GetUserAgent() and GetUserAgentMetadata(), which have no BrowserContext.
++  // The default leaves `user_agent` and `metadata` unchanged.
++  virtual void OverrideUserAgentForBrowserContext(
++      BrowserContext* browser_context,
++      std::string* user_agent,
++      blink::UserAgentMetadata* metadata) {}
++
+   // Returns a 256x256 transparent background image of the product logo, i.e.
+   // the browser icon, if available.
+   virtual std::optional<gfx::ImageSkia> GetProductLogo();

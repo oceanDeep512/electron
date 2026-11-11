@@ -43,8 +43,12 @@
 #include "content/public/browser/preconnect_manager.h"
 #include "content/public/browser/render_frame_host.h"
 #include "content/public/browser/render_process_host.h"
+#include "content/public/browser/service_worker_context.h"
 #include "content/public/browser/storage_partition.h"
 #include "content/public/browser/web_contents.h"
+#include "net/http/http_util.h"
+#include "third_party/icu/source/common/unicode/unistr.h"
+#include "third_party/icu/source/i18n/unicode/timezone.h"
 #include "content/public/browser/web_contents_media_capture_id.h"
 #include "content/public/browser/web_contents_observer.h"
 #include "gin/arguments.h"
@@ -439,6 +443,11 @@ ElectronBrowserContext::ElectronBrowserContext(
 ElectronBrowserContext::~ElectronBrowserContext() {
   DCHECK_CURRENTLY_ON(BrowserThread::UI);
 
+  if (intercept_state_) {
+    intercept_state_->ClearResponseBodyObservation();
+    intercept_state_->ClearWebSocketObservation();
+  }
+
   NotifyWillBeDestroyed();
 
   // Notify any keyed services of browser context destruction.
@@ -535,6 +544,77 @@ void ElectronBrowserContext::InitPrefs() {
 
 void ElectronBrowserContext::SetUserAgent(const std::string& user_agent) {
   user_agent_ = user_agent;
+}
+
+std::string ElectronBrowserContext::ApplyAgentPersona(AgentPersona persona) {
+  if (agent_persona_ && agent_persona_->id == persona.id)
+    return std::string();
+  if (agent_persona_)
+    return "this partition already has a different persona";
+  for (content::WebContents* contents :
+       content::WebContents::GetAllWebContents()) {
+    if (contents && contents->GetBrowserContext() == this) {
+      return "persona must be applied before the first page in this partition";
+    }
+  }
+  // A renderer or service worker started outside agentRuntime would keep the
+  // command line it was launched with, so the persona switches would never
+  // arrive. Spare renderers for this partition count: they are already alive.
+  content::StoragePartition* partition = GetDefaultStoragePartition();
+  for (auto it = content::RenderProcessHost::AllHostsIterator(); !it.IsAtEnd();
+       it.Advance()) {
+    content::RenderProcessHost* host = it.GetCurrentValue();
+    if (!host || host->IsDeletingSoon())
+      continue;
+    if (host->GetBrowserContext() == this ||
+        (partition && host->InSameStoragePartition(partition))) {
+      return "persona must be applied before the first renderer in this partition";
+    }
+  }
+  if (partition) {
+    if (auto* workers = partition->GetServiceWorkerContext()) {
+      if (!workers->GetRunningServiceWorkerInfos().empty()) {
+        return "persona must be applied before the first renderer in this partition";
+      }
+    }
+  }
+  // Create the zone to reject an id ICU does not know. adoptDefault is not
+  // called, so the browser process timezone stays unchanged.
+  std::unique_ptr<icu::TimeZone> zone(icu::TimeZone::createTimeZone(
+      icu::UnicodeString::fromUTF8(persona.timezone)));
+  if (!zone || *zone == icu::TimeZone::getUnknown())
+    return "timezone is not an ICU time zone id";
+  auto* network_context = GetDefaultStoragePartition()->GetNetworkContext();
+  if (!network_context)
+    return "network context is not available";
+  network_context->SetUserAgent(persona.user_agent);
+  network_context->SetAcceptLanguage(
+      net::HttpUtil::GenerateAcceptLanguageHeader(persona.accept_languages));
+  user_agent_ = persona.user_agent;
+  agent_persona_ = std::move(persona);
+  return std::string();
+}
+
+blink::UserAgentMetadata ElectronBrowserContext::GetAgentUserAgentMetadata()
+    const {
+  blink::UserAgentMetadata metadata;
+  if (!agent_persona_)
+    return metadata;
+  const AgentPersona& persona = *agent_persona_;
+  for (const auto& [brand, version] : persona.brands)
+    metadata.brand_version_list.emplace_back(brand, version);
+  for (const auto& [brand, version] : persona.full_version_list)
+    metadata.brand_full_version_list.emplace_back(brand, version);
+  metadata.full_version = persona.full_version;
+  metadata.platform = persona.platform;
+  metadata.platform_version = persona.platform_version;
+  metadata.architecture = persona.architecture;
+  metadata.bitness = persona.bitness;
+  metadata.model = persona.model;
+  metadata.mobile = persona.mobile;
+  metadata.wow64 = persona.wow64;
+  metadata.form_factors = persona.form_factors;
+  return metadata;
 }
 
 base::FilePath ElectronBrowserContext::GetPath() const {

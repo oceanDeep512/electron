@@ -139,6 +139,10 @@ class ElectronBrowserClient : public content::ContentBrowserClient,
   std::string GetUserAgent() override;
   void SetUserAgent(const std::string& user_agent);
   blink::UserAgentMetadata GetUserAgentMetadata() override;
+  void OverrideUserAgentForBrowserContext(
+      content::BrowserContext* browser_context,
+      std::string* user_agent,
+      blink::UserAgentMetadata* metadata) override;
 
   content::SerialDelegate* GetSerialDelegate() override;
 
@@ -285,6 +289,18 @@ class ElectronBrowserClient : public content::ContentBrowserClient,
           handshake_client,
       WebSocketOptions options) override;
   bool WillInterceptWebSocket(content::RenderFrameHost*) override;
+  bool WillInterceptWorkerWebSocket(
+      content::RenderProcessHost* process) override;
+  void CreateWorkerWebSocket(
+      content::RenderProcessHost* process,
+      const url::Origin& origin,
+      WebSocketFactory factory,
+      const GURL& url,
+      const net::SiteForCookies& site_for_cookies,
+      const std::optional<std::string>& user_agent,
+      mojo::PendingRemote<network::mojom::WebSocketHandshakeClient>
+          handshake_client,
+      WebSocketOptions options) override;
   bool HasWebRequestAPIProxy(content::BrowserContext* browser_context) override;
   void WillCreateURLLoaderFactory(
       content::BrowserContext* browser_context,

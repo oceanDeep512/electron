@@ -1,0 +1,225 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Electron Agent Runtime <agent-runtime@electron.local>
+Date: Wed, 11 Nov 2026 19:10:00 +0000
+Subject: [electron] override screen metrics without touching layout scale
+
+An agent persona passes these values on the renderer command line. The
+switches are absent unless that renderer belongs to a persona session, so
+other processes keep Chromium's behavior. Nothing here is compiled in this
+change.
+
+diff --git a/third_party/blink/renderer/core/frame/screen.cc b/third_party/blink/renderer/core/frame/screen.cc
+--- a/third_party/blink/renderer/core/frame/screen.cc
++++ b/third_party/blink/renderer/core/frame/screen.cc
+@@ -28,7 +28,13 @@
+ 
+ #include "third_party/blink/renderer/core/frame/screen.h"
+ 
++#include <optional>
++#include <vector>
++
++#include "base/command_line.h"
+ #include "base/numerics/safe_conversions.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
+ #include "services/network/public/mojom/permissions_policy/permissions_policy_feature.mojom-blink.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/event_target_names.h"
+@@ -41,6 +47,46 @@
+ 
+ namespace blink {
+ 
++namespace {
++
++struct AgentScreenOverride {
++  int width;
++  int height;
++  int avail_width;
++  int avail_height;
++  int depth;
++  float scale;
++};
++
++std::optional<AgentScreenOverride> ReadAgentScreenOverride() {
++  const std::string value =
++      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++          "electron-agent-screen");
++  if (value.empty())
++    return std::nullopt;
++  std::vector<std::string> parts = base::SplitString(
++      value, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_ALL);
++  if (parts.size() != 6)
++    return std::nullopt;
++  AgentScreenOverride screen;
++  double scale = 0;
++  if (!base::StringToInt(parts[0], &screen.width) ||
++      !base::StringToInt(parts[1], &screen.height) ||
++      !base::StringToInt(parts[2], &screen.avail_width) ||
++      !base::StringToInt(parts[3], &screen.avail_height) ||
++      !base::StringToInt(parts[4], &screen.depth) ||
++      !base::StringToDouble(parts[5], &scale) || screen.width < 1 ||
++      screen.height < 1 || screen.avail_width < 1 || screen.avail_height < 1 ||
++      scale <= 0) {
++    return std::nullopt;
++  }
++  screen.scale = static_cast<float>(scale);
++  return screen;
++}
++
++}  // namespace
++
++
+ Screen::Screen(LocalDOMWindow* window, int64_t display_id)
+     : ExecutionContextClient(window), display_id_(display_id) {}
+ 
+@@ -109,6 +155,8 @@
+   if (!DomWindow()) {
+     return unknown_color_depth;
+   }
++  if (std::optional<AgentScreenOverride> agent = ReadAgentScreenOverride())
++    return static_cast<unsigned>(agent->depth);
+   return GetScreenInfo().depth == 0
+              ? unknown_color_depth
+              : base::saturated_cast<unsigned>(GetScreenInfo().depth);
+@@ -173,6 +221,14 @@
+   if (!DomWindow())
+     return gfx::Rect();
+   LocalFrame* frame = DomWindow()->GetFrame();
++  // Persona metrics stay off the ScreenInfo used for layout and OSR.
++  if (std::optional<AgentScreenOverride> agent = ReadAgentScreenOverride()) {
++    gfx::Rect rect(0, 0, available ? agent->avail_width : agent->width,
++                   available ? agent->avail_height : agent->height);
++    if (frame->GetSettings()->GetReportScreenSizeInPhysicalPixelsQuirk())
++      return gfx::ScaleToRoundedRect(rect, agent->scale);
++    return rect;
++  }
+   const display::ScreenInfo& screen_info = GetScreenInfo();
+   gfx::Rect rect = available ? screen_info.available_rect : screen_info.rect;
+   if (frame->GetSettings()->GetReportScreenSizeInPhysicalPixelsQuirk())
+diff --git a/third_party/blink/renderer/core/css/media_values.cc b/third_party/blink/renderer/core/css/media_values.cc
+--- a/third_party/blink/renderer/core/css/media_values.cc
++++ b/third_party/blink/renderer/core/css/media_values.cc
+@@ -4,6 +4,12 @@
+ 
+ #include "third_party/blink/renderer/core/css/media_values.h"
+ 
++#include <optional>
++#include <vector>
++
++#include "base/command_line.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
+ #include "third_party/blink/public/common/css/scripting.h"
+ #include "third_party/blink/renderer/core/css/css_resolution_units.h"
+ #include "third_party/blink/renderer/core/css/css_to_length_conversion_data.h"
+@@ -33,6 +39,46 @@
+ 
+ namespace blink {
+ 
++namespace {
++
++struct AgentScreenOverride {
++  int width;
++  int height;
++  int avail_width;
++  int avail_height;
++  int depth;
++  float scale;
++};
++
++std::optional<AgentScreenOverride> ReadAgentScreenOverride() {
++  const std::string value =
++      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++          "electron-agent-screen");
++  if (value.empty())
++    return std::nullopt;
++  std::vector<std::string> parts = base::SplitString(
++      value, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_ALL);
++  if (parts.size() != 6)
++    return std::nullopt;
++  AgentScreenOverride screen;
++  double scale = 0;
++  if (!base::StringToInt(parts[0], &screen.width) ||
++      !base::StringToInt(parts[1], &screen.height) ||
++      !base::StringToInt(parts[2], &screen.avail_width) ||
++      !base::StringToInt(parts[3], &screen.avail_height) ||
++      !base::StringToInt(parts[4], &screen.depth) ||
++      !base::StringToDouble(parts[5], &scale) || screen.width < 1 ||
++      screen.height < 1 || screen.avail_width < 1 || screen.avail_height < 1 ||
++      scale <= 0) {
++    return std::nullopt;
++  }
++  screen.scale = static_cast<float>(scale);
++  return screen;
++}
++
++}  // namespace
++
++
+ ForcedColors CSSValueIDToForcedColors(CSSValueID id) {
+   switch (id) {
+     case CSSValueID::kActive:
+@@ -164,6 +210,13 @@
+ 
+ int MediaValues::CalculateDeviceWidth(LocalFrame* frame) {
+   DCHECK(frame && frame->View() && frame->GetSettings() && frame->GetPage());
++  if (std::optional<AgentScreenOverride> agent = ReadAgentScreenOverride()) {
++    int device_width = agent->width;
++    if (frame->GetSettings()->GetReportScreenSizeInPhysicalPixelsQuirk()) {
++      device_width = static_cast<int>(lroundf(device_width * agent->scale));
++    }
++    return device_width;
++  }
+   const display::ScreenInfo& screen_info =
+       frame->GetPage()->GetChromeClient().GetScreenInfo(*frame);
+   int device_width = screen_info.rect.width();
+@@ -176,6 +229,13 @@
+ 
+ int MediaValues::CalculateDeviceHeight(LocalFrame* frame) {
+   DCHECK(frame && frame->View() && frame->GetSettings() && frame->GetPage());
++  if (std::optional<AgentScreenOverride> agent = ReadAgentScreenOverride()) {
++    int device_height = agent->height;
++    if (frame->GetSettings()->GetReportScreenSizeInPhysicalPixelsQuirk()) {
++      device_height = static_cast<int>(lroundf(device_height * agent->scale));
++    }
++    return device_height;
++  }
+   const display::ScreenInfo& screen_info =
+       frame->GetPage()->GetChromeClient().GetScreenInfo(*frame);
+   int device_height = screen_info.rect.height();
+diff --git a/third_party/blink/renderer/core/frame/local_dom_window.cc b/third_party/blink/renderer/core/frame/local_dom_window.cc
+--- a/third_party/blink/renderer/core/frame/local_dom_window.cc
++++ b/third_party/blink/renderer/core/frame/local_dom_window.cc
+@@ -42,6 +42,12 @@
+ #include "third_party/blink/public/common/dom/dom_node_id.h"
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/public/common/switches.h"
++#include "base/command_line.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_split.h"
++
++#include <optional>
++#include <vector>
+ #include "third_party/blink/public/mojom/devtools/inspector_issue.mojom-blink.h"
+ #include "third_party/blink/public/mojom/frame/frame.mojom-blink.h"
+ #include "third_party/blink/public/mojom/permissions_policy/policy_disposition.mojom-blink.h"
+@@ -1963,6 +1969,19 @@
+   if (!GetFrame()) {
+     return 0.0;
+   }
++  // The frame scale used by layout and OSR stays on DevicePixelRatio().
++  const std::string value =
++      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(
++          "electron-agent-screen");
++  if (!value.empty()) {
++    std::vector<std::string> parts = base::SplitString(
++        value, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_ALL);
++    double scale = 0;
++    if (parts.size() == 6 && base::StringToDouble(parts[5], &scale) &&
++        scale > 0) {
++      return scale;
++    }
++  }
+ 
+   return GetFrame()->DevicePixelRatio();
+ }

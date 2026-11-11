@@ -127,6 +127,12 @@ class Session final : public gin::Wrappable<Session>,
                                    gin::Arguments* args);
   void SetPermissionCheckHandler(v8::Local<v8::Value> val,
                                  gin::Arguments* args);
+  void SetResponseBodyObservation(v8::Local<v8::Value> listener,
+                                  gin::Arguments* args);
+  void UpdateResponseBodyObservationLimits(gin::Arguments* args);
+  void SetWebSocketMessageObservation(v8::Local<v8::Value> listener,
+                                      gin::Arguments* args);
+  void UpdateWebSocketMessageObservationLimits(gin::Arguments* args);
   void SetDevicePermissionHandler(v8::Local<v8::Value> val,
                                   gin::Arguments* args);
   void SetUSBProtectedClassesHandler(v8::Local<v8::Value> val,
@@ -137,6 +143,7 @@ class Session final : public gin::Wrappable<Session>,
   v8::Local<v8::Promise> ClearAuthCache();
   void AllowNTLMCredentialsForDomains(const std::string& domains);
   void SetUserAgent(const std::string& user_agent, gin::Arguments* args);
+  void SetAgentPersona(gin::Arguments* args);
   std::string GetUserAgent();
   void SetSSLConfig(network::mojom::SSLConfigPtr config);
   bool IsPersistent();

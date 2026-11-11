@@ -8,6 +8,7 @@
 #include <shlobj.h>
 #endif
 
+#include <algorithm>
 #include <memory>
 #include <string_view>
 #include <utility>
@@ -27,6 +28,7 @@
 #include "base/path_service.h"
 #include "base/process/process_metrics.h"
 #include "base/strings/escape.h"
+#include "base/strings/string_number_conversions.h"
 #include "base/strings/string_util.h"
 #include "chrome/browser/browser_process.h"
 #include "chrome/browser/picture_in_picture/video_overlay_window.h"
@@ -34,6 +36,7 @@
 #include "chrome/common/chrome_switches.h"
 #include "chrome/common/chrome_version.h"
 #include "components/embedder_support/user_agent_utils.h"
+#include "third_party/blink/public/common/peerconnection/webrtc_ip_handling_policy.h"
 #include "components/net_log/chrome_net_log.h"
 #include "components/network_hints/common/network_hints.mojom.h"
 #include "content/browser/keyboard_lock/keyboard_lock_service_impl.h"  // nogncheck
@@ -531,6 +534,20 @@ void ElectronBrowserClient::OverrideWebPreferences(
   if (auto* web_preferences = WebContentsPreferences::From(web_contents)) {
     web_preferences->OverrideWebkitPrefs(prefs, renderer_prefs);
   }
+
+  // Every WebContents for a persona partition, including ones created later,
+  // gets the session WebRTC policy. Chromium calls this hook when preferences
+  // are built and again when they are refreshed.
+  auto* persona_context = static_cast<ElectronBrowserContext*>(
+      web_contents->GetBrowserContext());
+  if (persona_context) {
+    const auto* persona = persona_context->agent_persona();
+    if (persona && !persona->webrtc_ip_handling_policy.empty() &&
+        persona->webrtc_ip_handling_policy != "default") {
+      renderer_prefs->webrtc_ip_handling_policy =
+          blink::ToWebRTCIPHandlingPolicy(persona->webrtc_ip_handling_policy);
+    }
+  }
 }
 
 bool ElectronBrowserClient::WebPreferencesNeedUpdateForColorRelatedStateChanges(
@@ -689,6 +706,64 @@ void ElectronBrowserClient::AppendExtraCommandLineSwitches(
     content::ChildProcessId unsafe_process_id =
         content::ChildProcessId::FromUnsafeValue(process_id);
     auto* render_process_host = content::RenderProcessHost::FromID(process_id);
+    if (render_process_host) {
+      auto* persona_context = static_cast<ElectronBrowserContext*>(
+          render_process_host->GetBrowserContext());
+      if (persona_context && persona_context->agent_persona()) {
+        const auto* persona = persona_context->agent_persona();
+        command_line->AppendSwitchASCII(
+            switches::kAgentHardwareConcurrency,
+            base::NumberToString(persona->hardware_concurrency));
+        command_line->AppendSwitchASCII(switches::kAgentDeviceMemory,
+                                        persona->device_memory);
+        command_line->AppendSwitchASCII(switches::kAgentTimezone,
+                                        persona->timezone);
+        if (!persona->seed.empty()) {
+          command_line->AppendSwitchASCII(switches::kAgentCanvasSeed,
+                                          persona->seed);
+          command_line->AppendSwitchASCII(switches::kAgentAudioSeed,
+                                          persona->seed);
+        }
+        if (persona->screen_width > 0) {
+          command_line->AppendSwitchASCII(
+              switches::kAgentScreen,
+              base::NumberToString(persona->screen_width) + "," +
+                  base::NumberToString(persona->screen_height) + "," +
+                  base::NumberToString(persona->screen_avail_width) + "," +
+                  base::NumberToString(persona->screen_avail_height) + "," +
+                  base::NumberToString(persona->screen_color_depth) + "," +
+                  base::NumberToString(persona->screen_device_scale_factor));
+        }
+        if (!persona->webgl_vendor.empty()) {
+          command_line->AppendSwitchASCII(switches::kAgentWebGLVendor,
+                                          persona->webgl_vendor);
+          command_line->AppendSwitchASCII(switches::kAgentWebGLRenderer,
+                                          persona->webgl_renderer);
+        }
+        if (!persona->webgpu_vendor.empty()) {
+          command_line->AppendSwitchASCII(switches::kAgentWebGPUVendor,
+                                          persona->webgpu_vendor);
+          command_line->AppendSwitchASCII(switches::kAgentWebGPUArchitecture,
+                                          persona->webgpu_architecture);
+          command_line->AppendSwitchASCII(switches::kAgentWebGPUDevice,
+                                          persona->webgpu_device);
+          command_line->AppendSwitchASCII(switches::kAgentWebGPUDescription,
+                                          persona->webgpu_description);
+        }
+        if (persona->font_policy_core) {
+          command_line->AppendSwitchASCII(switches::kAgentFontPolicy, "core");
+        }
+        if (persona->has_screen_color_index) {
+          command_line->AppendSwitchASCII(
+              switches::kAgentColorIndex,
+              base::NumberToString(persona->screen_color_index));
+        }
+        if (persona->has_screen_hdr) {
+          command_line->AppendSwitchASCII(switches::kAgentHdr,
+                                          persona->screen_hdr ? "1" : "0");
+        }
+      }
+    }
     content::WebContents* web_contents =
         GetWebContentsFromProcessID(unsafe_process_id);
     if (web_contents) {
@@ -1391,6 +1466,22 @@ blink::UserAgentMetadata ElectronBrowserClient::GetUserAgentMetadata() {
   return embedder_support::GetUserAgentMetadata();
 }
 
+void ElectronBrowserClient::OverrideUserAgentForBrowserContext(
+    content::BrowserContext* browser_context,
+    std::string* user_agent,
+    blink::UserAgentMetadata* metadata) {
+  // Shared workers and service workers ask the process-wide getter. A persona
+  // partition replaces that pair. Dedicated workers copy the document override
+  // and do not reach this method.
+  if (!browser_context || !user_agent || !metadata)
+    return;
+  auto* context = static_cast<ElectronBrowserContext*>(browser_context);
+  if (!context->agent_persona())
+    return;
+  *user_agent = context->agent_persona()->user_agent;
+  *metadata = context->GetAgentUserAgentMetadata();
+}
+
 mojo::PendingRemote<network::mojom::URLLoaderFactory>
 ElectronBrowserClient::CreateNonNetworkNavigationURLLoaderFactory(
     const std::string& scheme,
@@ -1653,8 +1744,18 @@ bool ElectronBrowserClient::HasWebRequestAPIProxy(
 
 bool ElectronBrowserClient::WillInterceptWebSocket(
     content::RenderFrameHost* frame) {
+  // Pages and dedicated workers. Shared and service workers use
+  // WillInterceptWorkerWebSocket because their connector has no frame.
+  // Main-process net.WebSocket never reaches either hook.
   if (!frame)
     return false;
+
+  auto* context =
+      static_cast<ElectronBrowserContext*>(frame->GetBrowserContext());
+  if (context && context->intercept_state() &&
+      context->intercept_state()->websocket_enabled()) {
+    return true;
+  }
 
   v8::Isolate* isolate = JavascriptEnvironment::GetIsolate();
   v8::HandleScope scope(isolate);
@@ -1679,6 +1780,42 @@ bool ElectronBrowserClient::WillInterceptWebSocket(
   return has_listener;
 }
 
+bool ElectronBrowserClient::WillInterceptWorkerWebSocket(
+    content::RenderProcessHost* process) {
+  if (!process)
+    return false;
+  auto* context =
+      static_cast<ElectronBrowserContext*>(process->GetBrowserContext());
+  return context && context->intercept_state() &&
+         context->intercept_state()->websocket_enabled();
+}
+
+void ElectronBrowserClient::CreateWorkerWebSocket(
+    content::RenderProcessHost* process,
+    const url::Origin& origin,
+    WebSocketFactory factory,
+    const GURL& url,
+    const net::SiteForCookies& site_for_cookies,
+    const std::optional<std::string>& user_agent,
+    mojo::PendingRemote<network::mojom::WebSocketHandshakeClient>
+        handshake_client,
+    WebSocketOptions options) {
+  if (!process)
+    return;
+  v8::Isolate* isolate = JavascriptEnvironment::GetIsolate();
+  v8::HandleScope scope(isolate);
+  auto* browser_context = process->GetBrowserContext();
+  auto* web_request = api::WebRequest::FromOrCreate(isolate, browser_context);
+  DCHECK(web_request);
+  // The worker has no frame. The process BrowserContext is the session.
+  // Extension websocket proxies are not on this path: a null frame never
+  // reached ProxyWebSocket, and this hook runs only while observation is on.
+  ProxyingWebSocket::StartProxying(
+      web_request, std::move(factory), url, site_for_cookies, user_agent,
+      std::move(handshake_client), true, process->GetDeprecatedID(),
+      IPC::mojom::kRoutingIdNone, origin, browser_context, &next_id_);
+}
+
 void ElectronBrowserClient::CreateWebSocket(
     content::RenderFrameHost* frame,
     WebSocketFactory factory,
@@ -1694,18 +1831,88 @@ void ElectronBrowserClient::CreateWebSocket(
 
   auto* web_request = api::WebRequest::FromOrCreate(isolate, browser_context);
   DCHECK(web_request);
+  auto* electron_context = static_cast<ElectronBrowserContext*>(browser_context);
+  const bool observe_messages =
+      electron_context->intercept_state() &&
+      electron_context->intercept_state()->websocket_enabled();
 
 #if BUILDFLAG(ENABLE_ELECTRON_EXTENSIONS)
-  if (!web_request->HasListener()) {
-    auto* web_request_api = extensions::BrowserContextKeyedAPIFactory<
-        extensions::WebRequestAPI>::Get(browser_context);
-
-    if (web_request_api && web_request_api->MayHaveProxies()) {
-      web_request_api->ProxyWebSocket(
-          frame, std::move(factory), url, site_for_cookies, user_agent,
-          std::move(handshake_client), std::move(options.header_client));
-      return;
-    }
+  auto* web_request_api = extensions::BrowserContextKeyedAPIFactory<
+      extensions::WebRequestAPI>::Get(browser_context);
+  const bool extension_proxy =
+      web_request_api && web_request_api->MayHaveProxies();
+  // No observation and no Electron webRequest listener: the extension proxy
+  // remains the only hop.
+  if (!observe_messages && !web_request->HasListener() && extension_proxy) {
+    web_request_api->ProxyWebSocket(
+        frame, std::move(factory), url, site_for_cookies, user_agent,
+        std::move(handshake_client), std::move(options.header_client));
+    return;
+  }
+  // Observation stays on Electron's forwarder. The extension proxy is the
+  // next hop, so both run. Shared and service workers never reach here.
+  if (observe_messages && extension_proxy) {
+    const auto frame_id = frame->GetGlobalId();
+    factory = base::BindOnce(
+        [](extensions::WebRequestAPI* api,
+           content::GlobalRenderFrameHostId frame_id,
+           content::ContentBrowserClient::WebSocketFactory network_factory,
+           net::SiteForCookies site_for_cookies,
+           std::optional<std::string> user_agent, const GURL& request_url,
+           std::vector<network::mojom::HttpHeaderPtr> electron_headers,
+           mojo::PendingRemote<network::mojom::WebSocketHandshakeClient>
+               handshake_client,
+           mojo::PendingRemote<network::mojom::WebSocketAuthenticationHandler>
+               electron_auth,
+           mojo::PendingRemote<network::mojom::TrustedHeaderClient>
+               header_client) {
+          content::RenderFrameHost* live =
+              content::RenderFrameHost::FromID(frame_id);
+          if (!live)
+            return;
+          auto wrapped = base::BindOnce(
+              [](content::ContentBrowserClient::WebSocketFactory inner,
+                 std::vector<network::mojom::HttpHeaderPtr> first_headers,
+                 mojo::PendingRemote<
+                     network::mojom::WebSocketAuthenticationHandler>
+                     first_auth,
+                 const GURL& inner_url,
+                 std::vector<network::mojom::HttpHeaderPtr> extension_headers,
+                 mojo::PendingRemote<network::mojom::WebSocketHandshakeClient>
+                     inner_client,
+                 mojo::PendingRemote<
+                     network::mojom::WebSocketAuthenticationHandler>
+                     extension_auth,
+                 mojo::PendingRemote<network::mojom::TrustedHeaderClient>
+                     inner_header) {
+                std::vector<network::mojom::HttpHeaderPtr> merged;
+                std::vector<std::string> seen;
+                auto take = [&](network::mojom::HttpHeaderPtr header) {
+                  const std::string key = base::ToLowerASCII(header->name);
+                  if (std::find(seen.begin(), seen.end(), key) != seen.end())
+                    return;
+                  seen.push_back(key);
+                  merged.push_back(std::move(header));
+                };
+                for (auto& header : extension_headers)
+                  take(std::move(header));
+                for (auto& header : first_headers)
+                  take(std::move(header));
+                auto auth = extension_auth.is_valid() ? std::move(extension_auth)
+                                                      : std::move(first_auth);
+                std::move(inner).Run(inner_url, std::move(merged),
+                                     std::move(inner_client), std::move(auth),
+                                     std::move(inner_header));
+              },
+              std::move(network_factory), std::move(electron_headers),
+              std::move(electron_auth));
+          api->ProxyWebSocket(live, std::move(wrapped), request_url,
+                              site_for_cookies, user_agent,
+                              std::move(handshake_client),
+                              std::move(header_client));
+        },
+        web_request_api, frame_id, std::move(factory), site_for_cookies,
+        user_agent);
   }
 #endif
 
@@ -2037,6 +2244,22 @@ bool ElectronBrowserClient::ShouldUseSpareRenderProcessHost(
     std::optional<
         content::ContentBrowserClient::SpareProcessRefusedByEmbedderReason>&
         refused_reason) {
+  // A spare renderer is launched before it is bound to a persona, so it would
+  // miss the renderer switches. Chromium 159.0.8140.0's
+  // SpareProcessRefusedByEmbedderReason is DefaultDisabled, NoProfile,
+  // TopFrameChromeWebUI, InstantRendererForNewTabPage, ExtensionProcess,
+  // JitDisabled, V8OptimizationsDisabled, or DisallowV8FeatureFlagOverrides.
+  // None of those name a persona. DefaultDisabled is the general embedder
+  // refusal, the same value this method uses when spares are turned off.
+  if (browser_context) {
+    auto* persona_context =
+        static_cast<ElectronBrowserContext*>(browser_context);
+    if (persona_context->has_agent_persona()) {
+      refused_reason = content::ContentBrowserClient::
+          SpareProcessRefusedByEmbedderReason::DefaultDisabled;
+      return false;
+    }
+  }
   // Extension and WebUI (chrome://, devtools://) frames get renderer switches
   // and bindings of their own, whatever WebContents hosts them.
   if (

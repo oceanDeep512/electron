@@ -25,6 +25,8 @@
 #include "base/files/file_util.h"
 #include "base/functional/callback_helpers.h"
 #include "base/json/json_reader.h"
+#include "base/memory/ref_counted.h"
+#include "base/memory/scoped_refptr.h"
 #include "base/memory/weak_ptr.h"
 #include "base/no_destructor.h"
 #include "base/numerics/safe_conversions.h"
@@ -35,6 +37,7 @@
 #include "base/task/current_thread.h"
 #include "base/task/sequenced_task_runner.h"
 #include "base/threading/scoped_blocking_call.h"
+#include "base/time/time.h"
 #include "base/timer/elapsed_timer.h"
 #include "base/unguessable_token.h"
 #include "base/values.h"
@@ -193,11 +196,16 @@
 #include "third_party/blink/public/mojom/frame/fullscreen.mojom.h"
 #include "third_party/blink/public/mojom/messaging/transferable_message.mojom.h"
 #include "third_party/blink/public/mojom/renderer_preferences.mojom.h"
+#include "ui/accessibility/ax_enum_util.h"
+#include "ui/accessibility/ax_mode.h"
+#include "ui/accessibility/ax_node_data.h"
+#include "ui/accessibility/ax_tree_update.h"
 #include "ui/accessibility/platform/ax_platform.h"
 #include "ui/base/cursor/cursor.h"
 #include "ui/base/cursor/mojom/cursor_type.mojom-shared.h"
 #include "ui/base/mojom/menu_source_type.mojom.h"
 #include "ui/events/base_event_utils.h"
+#include "ui/gfx/geometry/rect_f.h"
 #include "ui/gfx/image/image_skia.h"
 #include "ui/views/widget/widget.h"
 #include "url/gurl.h"
@@ -961,6 +969,89 @@ WebContents::Type GetTypeFromViewType(extensions::mojom::ViewType view_type) {
 
 #endif
 
+namespace {
+
+// Owns the JS promise for one RequestAXTreeSnapshot call. The callback may
+// run after the page is destroyed; |settled| makes that callback a no-op.
+struct AXSnapshotRequest : public base::RefCounted<AXSnapshotRequest> {
+  explicit AXSnapshotRequest(v8::Isolate* isolate) : promise(isolate) {}
+
+  gin_helper::Promise<base::Value::Dict> promise;
+  std::string frame_policy;
+  size_t max_nodes = 0;
+  bool settled = false;
+
+  void Reject(const std::string& message) {
+    if (settled)
+      return;
+    settled = true;
+    if (!v8::Isolate::TryGetCurrent())
+      return;
+    promise.RejectWithErrorMessage(message);
+  }
+
+  void Resolve(base::Value::Dict value) {
+    if (settled)
+      return;
+    settled = true;
+    if (!v8::Isolate::TryGetCurrent())
+      return;
+    promise.Resolve(std::move(value));
+  }
+
+ private:
+  friend class base::RefCounted<AXSnapshotRequest>;
+  ~AXSnapshotRequest() = default;
+};
+
+base::Value::Dict SerializeAXTree(const AXSnapshotRequest& request,
+                                  const ui::AXTreeUpdate& update) {
+  base::Value::List nodes;
+  for (const ui::AXNodeData& node : update.nodes) {
+    std::string name;
+    if (node.HasStringAttribute(ax::mojom::StringAttribute::kName))
+      name = node.GetStringAttribute(ax::mojom::StringAttribute::kName);
+
+    base::Value::List child_ids;
+    for (ui::AXNodeID child_id : node.child_ids)
+      child_ids.Append(static_cast<int>(child_id));
+
+    const gfx::RectF& rect = node.relative_bounds.bounds;
+    base::Value::Dict bounds;
+    bounds.Set("x", static_cast<double>(rect.x()));
+    bounds.Set("y", static_cast<double>(rect.y()));
+    bounds.Set("width", static_cast<double>(rect.width()));
+    bounds.Set("height", static_cast<double>(rect.height()));
+
+    base::Value::Dict entry;
+    entry.Set("id", static_cast<int>(node.id));
+    entry.Set("role", std::string(ui::ToString(node.role)));
+    entry.Set("name", std::move(name));
+    entry.Set("childIds", std::move(child_ids));
+    entry.Set("ignored", node.IsIgnored());
+    entry.Set("bounds", std::move(bounds));
+    entry.Set("offsetContainerId",
+              static_cast<int>(node.relative_bounds.offset_container_id));
+    entry.Set("hasTransform", node.relative_bounds.transform != nullptr);
+    nodes.Append(std::move(entry));
+  }
+
+  base::Value::Dict result;
+  result.Set("rootId", static_cast<int>(update.root_id));
+  result.Set("focusId", update.has_tree_data
+                            ? static_cast<int>(update.tree_data.focus_id)
+                            : 0);
+  result.Set("url", update.has_tree_data ? update.tree_data.url : std::string());
+  result.Set("title",
+             update.has_tree_data ? update.tree_data.title : std::string());
+  result.Set("framePolicy", request.frame_policy);
+  result.Set("maxNodes", static_cast<int>(request.max_nodes));
+  result.Set("nodes", std::move(nodes));
+  return result;
+}
+
+}  // namespace
+
 // Native registrations and resources outlive an unreachable API wrapper until
 // deferred cleanup runs. Only weak lookups may cross back into the cppgc heap.
 // One dispose observer also drains these resources before isolate shutdown.
@@ -1607,7 +1698,63 @@ class WebContents::NativeLifecycle final
       guest_delegate_->WillDestroy();
   }
 
+  void CancelAXSnapshot(const std::string& message) {
+    if (!ax_snapshot_)
+      return;
+    scoped_refptr<AXSnapshotRequest> request = std::move(ax_snapshot_);
+    request->Reject(message);
+  }
+
+  void RequestAgentAXSnapshot(scoped_refptr<AXSnapshotRequest> request,
+                              int max_nodes,
+                              int timeout_ms) {
+    ax_snapshot_ = request;
+    content::WebContents* contents = web_contents();
+    if (!contents) {
+      CancelAXSnapshot("The page was destroyed");
+      return;
+    }
+    // RequestAXTreeSnapshot is one-shot and does not change accessibility
+    // mode. kNativeAPIs is left unset so this is not a native AT client.
+    // kInlineTextBoxes is omitted because the snapshot implementation
+    // strips it.
+    ui::AXMode mode(ui::AXMode::kWebContents | ui::AXMode::kExtendedProperties);
+    auto policy =
+        request->frame_policy == "same-origin"
+            ? content::WebContents::AXTreeSnapshotPolicy::
+                  kSameOriginDirectDescendants
+            : content::WebContents::AXTreeSnapshotPolicy::kAll;
+    contents->RequestAXTreeSnapshot(
+        base::BindOnce(&WebContents::NativeLifecycle::OnAXSnapshot,
+                       weak_factory_.GetWeakPtr(), request),
+        mode, static_cast<size_t>(max_nodes), base::Milliseconds(timeout_ms),
+        policy);
+  }
+
+  void OnAXSnapshot(scoped_refptr<AXSnapshotRequest> request,
+                    ui::AXTreeUpdate& update) {
+    if (!content::BrowserThread::CurrentlyOn(content::BrowserThread::UI)) {
+      content::GetUIThreadTaskRunner({})->PostTask(
+          FROM_HERE,
+          base::BindOnce(&WebContents::NativeLifecycle::CompleteAXSnapshot,
+                         weak_factory_.GetWeakPtr(), request,
+                         std::move(update)));
+      return;
+    }
+    CompleteAXSnapshot(request, std::move(update));
+  }
+
+  void CompleteAXSnapshot(scoped_refptr<AXSnapshotRequest> request,
+                          ui::AXTreeUpdate update) {
+    if (ax_snapshot_.get() == request.get())
+      ax_snapshot_.reset();
+    if (request->settled)
+      return;
+    request->Resolve(SerializeAXTree(*request, update));
+  }
+
   void DisposeNative() {
+    CancelAXSnapshot("The page was destroyed");
     if (disposed_)
       return;
     disposed_ = true;
@@ -1641,6 +1788,7 @@ class WebContents::NativeLifecycle final
 
   cppgc::WeakPersistent<WebContents> contents_;
   LoadURLPromises load_url_promises_;
+  scoped_refptr<AXSnapshotRequest> ax_snapshot_;
   std::unique_ptr<InspectableWebContents> inspectable_web_contents_;
   std::unique_ptr<WebViewGuestDelegate> guest_delegate_;
   std::unique_ptr<FrameSubscriber> frame_subscriber_;
@@ -1939,7 +2087,18 @@ void WebContents::InitWithSessionAndOptions(
     accept_languages += language + ",";
   }
   accept_languages.pop_back();
+  if (const auto* persona = browser_context->agent_persona()) {
+    if (!persona->accept_languages.empty())
+      accept_languages = persona->accept_languages;
+  }
   prefs->accept_languages = accept_languages;
+  if (const auto* persona = browser_context->agent_persona()) {
+    if (!persona->webrtc_ip_handling_policy.empty() &&
+        persona->webrtc_ip_handling_policy != "default" &&
+        GetWebRTCIPHandlingPolicy() != persona->webrtc_ip_handling_policy) {
+      SetWebRTCIPHandlingPolicy(persona->webrtc_ip_handling_policy);
+    }
+  }
 
 #if BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_WIN)
   // Update font settings.
@@ -3153,6 +3312,7 @@ void WebContents::RenderViewDeleted(content::RenderViewHost* render_view_host) {
 
 void WebContents::PrimaryMainFrameRenderProcessGone(
     base::TerminationStatus status) {
+  native_lifecycle_->CancelAXSnapshot("The renderer crashed");
   // This fires while RenderProcessHostImpl is still notifying observers of
   // the process death. Emit asynchronously so app code (e.g. a synchronous
   // reload() in the handler) can't re-launch the renderer from inside that
@@ -3473,6 +3633,15 @@ void WebContents::DidStartNavigation(
       navigation_handle->GetURL().possibly_invalid_spec(),
       navigation_handle->IsSameDocument(), navigation_handle->IsInMainFrame());
   EmitNavigationEvent("did-start-navigation", navigation_handle);
+  // A cross-document main-frame navigation invalidates an in-flight tree.
+  // Same-document and subframe navigations do not. about:blank is the initial
+  // document and is ignored, matching agentRuntime navigation arming.
+  if (navigation_handle->IsInMainFrame() &&
+      !navigation_handle->IsSameDocument() &&
+      !navigation_handle->GetURL().SchemeIs(url::kAboutScheme)) {
+    native_lifecycle_->CancelAXSnapshot(
+        "The page navigated before the accessibility snapshot completed");
+  }
 }
 
 void WebContents::DidRedirectNavigation(
@@ -3822,6 +3991,8 @@ void WebContents::WebContentsDestroyed() {
   if (destroyed_)
     return;
   destroyed_ = true;
+  if (native_lifecycle_)
+    native_lifecycle_->CancelAXSnapshot("The page was destroyed");
   weak_factory_.Invalidate();
   DetachNativeCallbacks();
   keep_alive_.Clear();
@@ -4273,6 +4444,10 @@ v8::Local<v8::Promise> WebContents::RestoreHistory(
 
   blink::UserAgentOverride ua_override;
   ua_override.ua_string_override = GetUserAgent();
+  if (GetBrowserContext()->agent_persona()) {
+    ua_override.ua_metadata_override =
+        GetBrowserContext()->GetAgentUserAgentMetadata();
+  }
 
   for (const auto& entry : entries) {
     content::NavigationEntry* nav_entry = nullptr;
@@ -4467,8 +4642,12 @@ void WebContents::ForcefullyCrashRenderer() {
 void WebContents::SetUserAgent(const std::string& user_agent) {
   blink::UserAgentOverride ua_override;
   ua_override.ua_string_override = user_agent;
-  if (!user_agent.empty())
+  if (GetBrowserContext()->agent_persona()) {
+    ua_override.ua_metadata_override =
+        GetBrowserContext()->GetAgentUserAgentMetadata();
+  } else if (!user_agent.empty()) {
     ua_override.ua_metadata_override = embedder_support::GetUserAgentMetadata();
+  }
 
   web_contents()->SetUserAgentOverride(ua_override, false);
 }
@@ -5383,6 +5562,72 @@ v8::Local<v8::Promise> WebContents::CapturePage(gin::Arguments* args) {
       gfx::Rect(rect.origin(), view_size), bitmap_size, base::TimeDelta(),
       base::BindOnce(&OnCapturePageDone, std::move(promise),
                      std::move(capture_handle), scale_factor));
+  return handle;
+}
+
+v8::Local<v8::Promise> WebContents::CaptureAccessibilitySnapshot(
+    gin::Arguments* args) {
+  v8::Isolate* isolate = args->isolate();
+  auto request = base::MakeRefCounted<AXSnapshotRequest>(isolate);
+  v8::Local<v8::Promise> handle = request->promise.GetHandle();
+
+  if (destroyed_ || !web_contents()) {
+    request->Reject("The page was destroyed");
+    return handle;
+  }
+  if (IsCrashed()) {
+    request->Reject("The renderer has crashed");
+    return handle;
+  }
+  if (native_lifecycle_->ax_snapshot_) {
+    request->Reject("An accessibility snapshot is already in progress");
+    return handle;
+  }
+
+  int max_nodes = 2000;
+  int timeout_ms = 10000;
+  std::string frame_policy = "all";
+  if (args->Length() > 1) {
+    request->Reject(
+        "captureAccessibilitySnapshot accepts at most one options object");
+    return handle;
+  }
+  if (args->Length() == 1) {
+    gin_helper::Dictionary options;
+    if (!args->GetNext(&options)) {
+      request->Reject("options must be an object");
+      return handle;
+    }
+    if (options.Has("maxNodes") && !options.Get("maxNodes", &max_nodes)) {
+      request->Reject("maxNodes must be an integer");
+      return handle;
+    }
+    if (options.Has("timeoutMs") && !options.Get("timeoutMs", &timeout_ms)) {
+      request->Reject("timeoutMs must be an integer");
+      return handle;
+    }
+    if (options.Has("framePolicy") &&
+        !options.Get("framePolicy", &frame_policy)) {
+      request->Reject("framePolicy must be a string");
+      return handle;
+    }
+  }
+  if (max_nodes < 1 || max_nodes > 100000) {
+    request->Reject("maxNodes must be an integer from 1 to 100000");
+    return handle;
+  }
+  if (timeout_ms < 1 || timeout_ms > 120000) {
+    request->Reject("timeoutMs must be an integer from 1 to 120000");
+    return handle;
+  }
+  if (frame_policy != "all" && frame_policy != "same-origin") {
+    request->Reject("framePolicy must be 'all' or 'same-origin'");
+    return handle;
+  }
+
+  request->frame_policy = std::move(frame_policy);
+  request->max_nodes = static_cast<size_t>(max_nodes);
+  native_lifecycle_->RequestAgentAXSnapshot(request, max_nodes, timeout_ms);
   return handle;
 }
 
@@ -6631,6 +6876,8 @@ void WebContents::FillObjectTemplate(v8::Isolate* isolate,
           "showDefinitionForSelection")
       .SetMethod<&WebContents::CopyImageAt>("copyImageAt")
       .SetMethod<&WebContents::CapturePage>("capturePage")
+      .SetMethod<&WebContents::CaptureAccessibilitySnapshot>(
+          "captureAccessibilitySnapshot")
       .SetMethod<&WebContents::SetEmbedder>("setEmbedder")
       .SetMethod<&WebContents::SetDevToolsWebContents>("setDevToolsWebContents")
       .SetMethod<&WebContents::IsBeingCaptured>("isBeingCaptured")

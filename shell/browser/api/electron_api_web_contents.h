@@ -343,6 +343,8 @@ class WebContents final : public gin::Wrappable<WebContents>,
   // Captures the page with |rect|, |callback| would be called when capturing is
   // done.
   v8::Local<v8::Promise> CapturePage(gin::Arguments* args);
+  // One-shot accessibility tree. Does not change accessibility mode.
+  v8::Local<v8::Promise> CaptureAccessibilitySnapshot(gin::Arguments* args);
 
   // Methods for creating <webview>.
   [[nodiscard]] bool is_guest() const { return type_ == Type::kWebView; }
